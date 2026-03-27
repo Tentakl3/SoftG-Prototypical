@@ -10,6 +10,7 @@ from .mnistevenodd_SoftG_main import LTN_SoftG_MNISTEvenOdd
 if __name__ == '__main__':
     results_tries = {}
     schedules = ["exp", "linear", "log"]
+    #schedules = ["exp"]
     for schedule in schedules:
         for i in range(1):
             seed = i*128

@@ -8,15 +8,20 @@ import random # Added import
 from z3 import *
 
 from backbones.MNIST_EvenOdd.PNet_MNISTEvenOdd import LearnableProtoNet_CNN
+from samplers.MNIST_EvenOdd.mnistevenodd_sampler import Sampler
+from projections.MNIST_EvenOdd.projection_mnistevenodd import Projection
+from ltn_utils.MNIST_EvenOdd.ltn_utils_mnistevenodd import Logic
 
 class LTN_SoftProto_MNISTEvenOdd:
     def __init__(self, num_classes, anchor_imgs, layer_sizes=(512, 256, 100, 10)):
         #self.protonet = LearnableProtoNet_CNN_MNIST(num_classes=num_classes, layer_sizes=layer_sizes).to(ltn.device)
         self.protonet = LearnableProtoNet_CNN(num_classes=num_classes).to(ltn.device)
+        self.sampler = Sampler()
+        self.projection = Projection()
+        self.logical = Logic()
         self.num_classes = num_classes
         self.anchor_imgs = anchor_imgs.to(ltn.device)
         self.addition_candidate_cache = {}
-        self.pairs_cache = self.get_pairs_cache()
         self.alpha = 0.2
 
     def train(self, train_loader, test_loader, epochs, schedule):
@@ -98,13 +103,12 @@ class LTN_SoftProto_MNISTEvenOdd:
                         self.addition_candidate_cache[idx.item()] = new_latent_digits[i]
 
                 latent_digits = latent_digits.to(ltn.device)
-                logical_loss = self.proto_truth_mnistaddition_soft(p_x, p_y, latent_digits)
-                #logical_loss = self.proto_truth_mnistaddition_soft(p_x, p_y, latent_digits)
+                logical_loss = self.logical.addition_proto_logic(p_x, p_y, latent_digits)
 
                 z_digits = torch.cat([z_x, z_y], dim=0)
                 latent_digits_reshape = torch.cat([latent_digits[:,0], latent_digits[:,1]], dim=0)
 
-                new_proto_loss = self.prototype_loss_new(z_digits, latent_digits_reshape)
+                new_proto_loss = self.prototype_loss(z_digits, latent_digits_reshape)
 
 
                 total_loss = 0.6 * new_proto_loss + logical_loss
@@ -240,31 +244,13 @@ class LTN_SoftProto_MNISTEvenOdd:
             'prototypes':self.protonet.prototypes.cpu().detach().numpy(),
         }
 
-    def proto_loss(self, z_anchor):
-
-        dist = (z_anchor - self.protonet.prototypes)**2
-        dist = torch.sum(dist, dim=-1)
-        return dist.mean()
-
-    def get_latent(self, p_x, p_y, addition_labels):
-        B, C = p_x.shape
-        with torch.no_grad():
-          pairs = []
-          for i in range(B):
-              d_x, d_y = self.solve_addition_assignment(p_x[i], p_y[i], addition_labels[i])
-              pairs.append((d_x, d_y))
-
-          pairs = torch.tensor(pairs)
-
-        return pairs
-
     def get_latent_sample(self, p_x, p_y, addition_labels):
         B, C = p_x.shape
         with torch.no_grad():
           pairs = []
           for i in range(B):
               n = addition_labels[i].item()
-              samples = self.pairs_cache[n]
+              samples = self.sampler.pairs_cache[n]
               d_x, d_y = self.solve_addition_assignment_sample(p_x[i], p_y[i], samples)
               pairs.append((d_x, d_y))
 
@@ -302,78 +288,6 @@ class LTN_SoftProto_MNISTEvenOdd:
         min_idx = np.argmin(costs)
         return sample[min_idx]
 
-    def solve_addition_assignment(self, prob_x, prob_y, target_sum):
-        opt = Optimize()
-
-        # Define integer variables for the two digits
-        d1 = Int('d1')
-        d2 = Int('d2')
-
-        # Constraints: Digits must be in range and sum must be correct
-        opt.add(d1 >= 0, d1 < self.num_classes)
-        opt.add(d2 >= 0, d2 < self.num_classes)
-        opt.add(d1 + d2 == int(target_sum))
-
-        # We want to maximize the probability (or minimize -log probability)
-        # Since Z3 handles Reals better for optimization:
-        costs_x = [-math.log(p.item() + 1e-8) for p in prob_x]
-        costs_y = [-math.log(p.item() + 1e-8) for p in prob_y]
-
-        # Mapping the choice of digit to the cost
-        cost_expr = Sum([If(d1 == i, costs_x[i], 0) for i in range(self.num_classes)]) + \
-                    Sum([If(d2 == i, costs_y[i], 0) for i in range(self.num_classes)])
-
-        opt.minimize(cost_expr)
-
-        if opt.check() == sat:
-            model = opt.model()
-            return model[d1].as_long(), model[d2].as_long()
-        else:
-            return torch.argmax(prob_x).item(), torch.argmax(prob_y).item()
-
-    def proto_truth_mnistaddition_soft(self, p_x, p_y, latent_digits):
-
-        Forall = ltn.Quantifier(ltn.fuzzy_ops.AggregPMeanError(p=2), quantifier="f")
-        Exists = ltn.Quantifier(ltn.fuzzy_ops.AggregPMean(p=2), quantifier="e")
-        Not = ltn.Connective(ltn.fuzzy_ops.NotStandard())
-        And = ltn.Connective(ltn.fuzzy_ops.AndMin())
-        Andx = ltn.Connective(ltn.fuzzy_ops.AndProd(stable=True))
-        Or = ltn.Connective(ltn.fuzzy_ops.OrMax())
-
-        d_1 = ltn.Variable("d_1", latent_digits[:, 0])
-        d_2 = ltn.Variable("d_2", latent_digits[:, 1])
-        P_x = ltn.Variable("P_x", p_x)
-        P_y = ltn.Variable("P_y", p_y)
-
-        Digit_s_d = ltn.Predicate(
-            func=lambda x, y: torch.gather(x, 1, y))
-
-        sat_agg = Forall(
-            ltn.diag(P_x, d_1, P_y, d_2),
-                And(Digit_s_d(P_x, d_1), Digit_s_d(P_y, d_2)), # Use fuzzy equality
-                p=2
-            ).value
-
-        return (1.-sat_agg)
-
-    def propose_neighbor(self, dx, n):
-        n_val = int(n)
-        original_dx = int(dx)
-        original_dy = n_val - original_dx # Assuming original_dy is also in [0,9]
-
-        possible_deltas = [-1, 1]
-        random.shuffle(possible_deltas)
-
-        for delta in possible_deltas:
-            proposed_dx = original_dx + delta
-            proposed_dy = n_val - proposed_dx
-
-            if 0 <= proposed_dx <= 9 and 0 <= proposed_dy <= 9:
-                return [proposed_dx, proposed_dy]
-
-        # If no valid neighbor found with delta -1 or 1, stick to the original valid pair
-        return [original_dx, original_dy] # Fallback to original pair, assuming it was valid
-
     def switch_latent(self, p_x, p_y, latent_digits, addition_labels, T):
         B, C = latent_digits.shape
         with torch.no_grad():
@@ -381,7 +295,7 @@ class LTN_SoftProto_MNISTEvenOdd:
           for i in range(B):
               n = addition_labels[i].item()
               d_x, d_y = latent_digits[i, 0].item(), latent_digits[i, 1].item()
-              new_d_x, new_d_y = self.propose_neighbor(d_x, n) #random.choice(self.pairs_cache[n]) #self.propose_neighbor(d_x, n)
+              new_d_x, new_d_y = self.projection.propose_neighbor(d_x, n) #random.choice(self.pairs_cache[n]) #self.propose_neighbor(d_x, n)
               P = - torch.log(p_x[i, d_x]+ 1e-8) - torch.log(p_y[i, d_y]+ 1e-8)
               P_new = - torch.log(p_x[i, new_d_x] + 1e-8) - torch.log(p_y[i, new_d_y] + 1e-8)
 
@@ -397,27 +311,7 @@ class LTN_SoftProto_MNISTEvenOdd:
           new_latent_digits = torch.tensor(new_latent_digits)
         return new_latent_digits
 
-    def get_pairs_cache(self):
-        z3_cache = {}
-        for n in range(19):
-            n_val = int(n)
-
-            s = Solver()
-            d1, d2 = Int('d1'), Int('d2')
-            s.add(d1 >= 0, d1 <= 9, d2 >= 0, d2 <= 9)
-            s.add(d1 + d2 == n_val)
-
-            solutions = []
-            while s.check() == sat:
-                m = s.model()
-                sol = (m[d1].as_long(), m[d2].as_long())
-                solutions.append(sol)
-                # Block this solution to find the next
-                s.add(Or(d1 != sol[0], d2 != sol[1]))
-            z3_cache[n_val] = solutions
-        return z3_cache
-
-    def prototype_loss_new(self, z_digits, batch_pairs):
+    def prototype_loss(self, z_digits, batch_pairs):
 
       total_loss = 0.0
 

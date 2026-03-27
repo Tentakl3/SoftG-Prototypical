@@ -10,7 +10,7 @@ import ltn
 from backbones.Sudoku4x4.PNet_Sudoku import LearnableProtoNet_CNN
 from samplers.Sudoku4x4.sudoku4x4_sampler import Sampler
 from projections.Sudoku4x4.projection_sudoku4x4 import Projection
-from ltn_utils.Sudoku4x4.ltn_utils_Sudoku4x4 import Logic
+from ltn_utils.Sudoku4x4.ltn_utils_sudoku4x4 import Logic
 
 
 class Proto_Sudoku:

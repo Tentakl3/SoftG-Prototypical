@@ -6,15 +6,20 @@ import random # Added import
 from z3 import *
 
 from backbones.MNIST_EvenOdd.CNN_MNIST import SingleDigitClassifier, LogitsToProbability
+from samplers.MNIST_EvenOdd.mnistevenodd_sampler import Sampler
+from projections.MNIST_EvenOdd.projection_mnistevenodd import Projection
+from ltn_utils.MNIST_EvenOdd.ltn_utils_mnistevenodd import Logic
 
 class LTN_SoftG_MNISTEvenOdd:
     def __init__(self, num_classes, layer_sizes=(512, 256, 100, 10)):
         self.num_classes = num_classes
         self.addition_candidate_cache = {}
-        self.pairs_cache = self.get_pairs_cache()
-        self.alpha = 0.2
         self.cnn_s_d = SingleDigitClassifier()
         self.Digit_s_d = ltn.Predicate(LogitsToProbability(self.cnn_s_d)).to(ltn.device)
+        self.sampler = Sampler()
+        self.projection = Projection()
+        self.logical = Logic()
+        self.alpha = 0.2
 
     def train(self, train_loader, test_loader, epochs, schedule):
         optimizer = torch.optim.Adam(self.Digit_s_d.parameters(), lr=0.001)
@@ -67,7 +72,7 @@ class LTN_SoftG_MNISTEvenOdd:
 
                 for (n, idx) in zip(addition_labels, sample_idx):
                     if idx.item() not in self.addition_candidate_cache:
-                        u = random.choice(self.pairs_cache[n.item()])
+                        u = random.choice(self.sampler.pairs_cache[n.item()])
                         self.addition_candidate_cache[idx.item()] = torch.tensor(u).to(ltn.device)
                     batch_candidates.append(self.addition_candidate_cache[idx.item()])
 
@@ -79,7 +84,7 @@ class LTN_SoftG_MNISTEvenOdd:
                 if epoch >= sampling_epoch:
                     batch_candidates = self.candidate_switch(p_1, p_2, batch_candidates.clone(), addition_labels, T, epoch)
 
-                sat = self.logic_loss(operand_images, batch_candidates, addition_labels)
+                sat = self.logical.addition_logic(self.Digit_s_d, operand_images, batch_candidates, addition_labels)
 
                 total_loss = (1. - sat)
 
@@ -219,10 +224,9 @@ class LTN_SoftG_MNISTEvenOdd:
           # Propose new candidates (same-parity, correct sum)
 
           if epoch <= 4:
-              u = [random.choice(self.pairs_cache[n.item()]) for n in addition_labels]
+              u = [random.choice(self.sampler.pairs_cache[n.item()]) for n in addition_labels]
           else:
-              #u = [random.choice(self.pairs_cache[n.item()]) for n in addition_labels]
-              u = [self.propose_neighbor(dx, n) for dx, n in zip(d1, addition_labels)]
+              u = [self.projection.propose_neighbor(dx, n) for dx, n in zip(d1, addition_labels)]
           new_candidates = torch.tensor(u, device=device)
 
           new_d1 = new_candidates[:, 0]
@@ -252,29 +256,6 @@ class LTN_SoftG_MNISTEvenOdd:
 
         return new_candidates
 
-    def logic_loss(self, operand_images, batch_candidates, addition_labels):
-        ltn_AndMin = ltn.Connective(ltn.fuzzy_ops.AndMin()) # Renamed to avoid collision with z3.And
-        ltn_exists = ltn.Quantifier(ltn.fuzzy_ops.AggregPMean(p=2), quantifier="e")
-        Forall = ltn.Quantifier(ltn.fuzzy_ops.AggregPMeanError(p=2), quantifier="f")
-
-        images_x = ltn.Variable("x", operand_images[:, 0])
-        images_y = ltn.Variable("y", operand_images[:, 1])
-        labels_n = ltn.Variable("n", addition_labels)
-
-        d_1 = ltn.Variable("d_1", batch_candidates[:, 0])
-        d_2 = ltn.Variable("d_2", batch_candidates[:, 1])
-
-        #d_1 = ltn.Variable("d_1", torch.tensor(range(10)))
-        #d_2 = ltn.Variable("d_2", torch.tensor(range(10)))
-
-        sat_agg = Forall(
-            ltn.diag(images_x, d_1, images_y, d_2),
-                ltn_AndMin(self.Digit_s_d(images_x, d_1), self.Digit_s_d(images_y, d_2)), # Use fuzzy equality
-                p=2
-            ).value
-
-        return sat_agg
-
     def f1_macro_multiclass(self, y_true, y_pred):
         classes = torch.unique(y_true)
         f1_per_class = []
@@ -291,42 +272,3 @@ class LTN_SoftG_MNISTEvenOdd:
             f1_per_class.append(f1)
 
         return torch.mean(torch.stack(f1_per_class))
-
-
-    def propose_neighbor(self, dx, n):
-        n_val = int(n)
-        original_dx = int(dx)
-        original_dy = n_val - original_dx # Assuming original_dy is also in [0,9]
-
-        possible_deltas = [-1, 1]
-        random.shuffle(possible_deltas)
-
-        for delta in possible_deltas:
-            proposed_dx = original_dx + delta
-            proposed_dy = n_val - proposed_dx
-
-            if 0 <= proposed_dx <= 9 and 0 <= proposed_dy <= 9:
-                return [proposed_dx, proposed_dy]
-
-        # If no valid neighbor found with delta -1 or 1, stick to the original valid pair
-        return [original_dx, original_dy] # Fallback to original pair, assuming it was valid
-
-    def get_pairs_cache(self):
-        z3_cache = {}
-        for n in range(19):
-            n_val = int(n)
-
-            s = Solver()
-            d1, d2 = Int('d1'), Int('d2')
-            s.add(d1 >= 0, d1 <= 9, d2 >= 0, d2 <= 9)
-            s.add(d1 + d2 == n_val)
-
-            solutions = []
-            while s.check() == sat:
-                m = s.model()
-                sol = (m[d1].as_long(), m[d2].as_long())
-                solutions.append(sol)
-                # Block this solution to find the next
-                s.add(Or(d1 != sol[0], d2 != sol[1]))
-            z3_cache[n_val] = solutions
-        return z3_cache

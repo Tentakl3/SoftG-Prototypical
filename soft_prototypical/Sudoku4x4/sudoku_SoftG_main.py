@@ -13,7 +13,7 @@ proj_index = {'1':[(0,0), (0,1)], '2': [(0,0), (1,0)], '3': [(1,0), (1,1)], '4':
 from backbones.Sudoku4x4.CNN_Sudoku import MNISTConv
 from samplers.Sudoku4x4.sudoku4x4_sampler import Sampler
 from projections.Sudoku4x4.projection_sudoku4x4 import Projection
-from ltn_utils.Sudoku4x4.ltn_utils_Sudoku4x4 import Logic
+from ltn_utils.Sudoku4x4.ltn_utils_sudoku4x4 import Logic
 
 class Soft_Sudoku:
     def __init__(self, num_classes, layer_sizes=(512, 256, 100, 10)):
