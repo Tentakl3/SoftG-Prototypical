@@ -22,3 +22,21 @@ class Projection:
 
         # If no valid neighbor found with delta -1 or 1, stick to the original valid pair
         return [original_dx, original_dy] # Fallback to original pair, assuming it was valid
+
+    def batch_propose_neighbor(self, dx, n):
+        possible_deltas = torch.tensor([-1, 1], device=dx.device)
+
+        device = dx.device
+        B = dx.shape[0]
+        rand_deltas = possible_deltas[torch.randint(0, 2, (B,), device=device)]
+        proposed_dx = dx + rand_deltas
+        proposed_dy = n - proposed_dx
+
+        mask_valid = (proposed_dx >= 0) & (proposed_dx <= 9) & (proposed_dy >= 0) & (proposed_dy <= 9)
+
+        # For invalid proposals, revert to original dx and dy
+        proposed_dx = torch.where(mask_valid, proposed_dx, dx)
+        proposed_dy = torch.where(mask_valid, proposed_dy, n - dx)
+
+        return torch.stack([proposed_dx, proposed_dy], dim=1)
+    

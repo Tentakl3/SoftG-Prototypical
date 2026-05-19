@@ -3,7 +3,6 @@ import torch
 import torch.nn.functional as F
 import math
 import random # Added import
-from z3 import *
 
 from backbones.MNIST_EvenOdd.CNN_MNIST import SingleDigitClassifier, LogitsToProbability
 from samplers.MNIST_EvenOdd.mnistevenodd_sampler import Sampler
@@ -13,7 +12,6 @@ from ltn_utils.MNIST_EvenOdd.ltn_utils_mnistevenodd import Logic
 class LTN_SoftG_MNISTEvenOdd:
     def __init__(self, num_classes, layer_sizes=(512, 256, 100, 10)):
         self.num_classes = num_classes
-        self.addition_candidate_cache = {}
         self.cnn_s_d = SingleDigitClassifier()
         self.Digit_s_d = ltn.Predicate(LogitsToProbability(self.cnn_s_d)).to(ltn.device)
         self.sampler = Sampler()
@@ -21,10 +19,12 @@ class LTN_SoftG_MNISTEvenOdd:
         self.logical = Logic()
         self.alpha = 0.2
 
-    def train(self, train_loader, test_loader, epochs, schedule):
+    def train(self, train_loader, test_loader, epochs, schedule, projection):
         optimizer = torch.optim.Adam(self.Digit_s_d.parameters(), lr=0.001)
         #optimizer = torch.optim.SGD(self.protonet.parameters(), lr=0.001, momentum=0.9, weight_decay=1e-4)
         criterion = torch.nn.CrossEntropyLoss()
+
+        addition_candidate_cache = torch.empty((len(train_loader.dataset), 2), dtype=torch.long, device=ltn.device)
 
         train_accs = []
         test_accs = []
@@ -66,23 +66,20 @@ class LTN_SoftG_MNISTEvenOdd:
                 addition_labels, mult_labels = addition_labels.to(ltn.device), mult_labels.to(ltn.device)
                 operand1_labels, operand2_labels = operand1_labels.to(ltn.device), operand2_labels.to(ltn.device)
                 operand_images = operand_images.to(ltn.device)
+                sample_idx = sample_idx.to(ltn.device)
                 image_x, image_y = operand_images[:, 0], operand_images[:, 1]
 
-                batch_candidates = []
+                if epoch == 0:
+                    addition_candidates = self.sampler.batch_sample(addition_labels)
+                    addition_candidate_cache[sample_idx] = addition_candidates
 
-                for (n, idx) in zip(addition_labels, sample_idx):
-                    if idx.item() not in self.addition_candidate_cache:
-                        u = random.choice(self.sampler.pairs_cache[n.item()])
-                        self.addition_candidate_cache[idx.item()] = torch.tensor(u).to(ltn.device)
-                    batch_candidates.append(self.addition_candidate_cache[idx.item()])
-
-                batch_candidates = torch.stack(batch_candidates)
+                batch_candidates = addition_candidate_cache[sample_idx]
 
                 p_1 = torch.softmax(self.cnn_s_d(operand_images[:, 0]), dim=1)
                 p_2 = torch.softmax(self.cnn_s_d(operand_images[:, 1]), dim=1)
 
                 if epoch >= sampling_epoch:
-                    batch_candidates = self.candidate_switch(p_1, p_2, batch_candidates.clone(), addition_labels, T, epoch)
+                    batch_candidates = self.batch_candidate_switch(p_1, p_2, batch_candidates.clone(), addition_labels, T, projection)
 
                 sat = self.logical.addition_logic(self.Digit_s_d, operand_images, batch_candidates, addition_labels)
 
@@ -212,63 +209,97 @@ class LTN_SoftG_MNISTEvenOdd:
             'test_operands_f1s':test_operands_f1s
         }
 
-    def candidate_switch(self, p_1, p_2, batch_candidates, addition_labels, T, epoch):
+    def candidate_switch(self, p_1, p_2, batch_candidates, addition_labels, T, projection):
         with torch.no_grad():
-          device = ltn.device
-          eps = 1e-8
+            device = ltn.device
+            eps = 1e-8
 
-          # Current candidates
-          d1 = batch_candidates[:, 0]
-          d2 = batch_candidates[:, 1]
+            # Current candidates
+            d1 = batch_candidates[:, 0]
+            d2 = batch_candidates[:, 1]
 
-          # Propose new candidates (same-parity, correct sum)
+            # Propose new candidates (same-parity, correct sum)
+            if projection == 'random':
+                u = [random.choice(self.sampler.pairs_cache[n.item()]) for n in addition_labels]
+            elif projection == 'mcmc':              
+                u = [self.projection.propose_neighbor(dx, n) for dx, n in zip(d1, addition_labels)]
 
-          if epoch <= 4:
-              u = [random.choice(self.sampler.pairs_cache[n.item()]) for n in addition_labels]
-          else:
-              u = [self.projection.propose_neighbor(dx, n) for dx, n in zip(d1, addition_labels)]
-          new_candidates = torch.tensor(u, device=device)
+            new_candidates = torch.tensor(u, device=device)
 
-          new_d1 = new_candidates[:, 0]
-          new_d2 = new_candidates[:, 1]
+            new_d1 = new_candidates[:, 0]
+            new_d2 = new_candidates[:, 1]
 
-          p_d1 = torch.gather(p_1, 1, d1.unsqueeze(1))
-          p_d2 = torch.gather(p_2, 1, d2.unsqueeze(1))
+            p_d1 = torch.gather(p_1, 1, d1.unsqueeze(1))
+            p_d2 = torch.gather(p_2, 1, d2.unsqueeze(1))
 
-          new_p_d1 = torch.gather(p_1, 1, new_d1.unsqueeze(1))
-          new_p_d2 = torch.gather(p_2, 1, new_d2.unsqueeze(1))
+            new_p_d1 = torch.gather(p_1, 1, new_d1.unsqueeze(1))
+            new_p_d2 = torch.gather(p_2, 1, new_d2.unsqueeze(1))
 
-          for idx, (p1, p2, n_p1, n_p2) in enumerate(zip(p_d1, p_d2, new_p_d1, new_p_d2)):
-            #P = torch.min(p1, p2) + eps
-            #P_new = torch.min(n_p1, n_p2) + eps
+            for idx, (p1, p2, n_p1, n_p2) in enumerate(zip(p_d1, p_d2, new_p_d1, new_p_d2)):
+                #P = torch.min(p1, p2) + eps
+                #P_new = torch.min(n_p1, n_p2) + eps
 
-            P = p1 * p2 + eps
-            P_new = n_p1 * n_p2 + eps
+                P = p1 * p2 + eps
+                P_new = n_p1 * n_p2 + eps
 
-            #delta_E = -torch.log(P_new) + torch.log(P)
-            #tau = torch.exp(-delta_E / T)
+                #delta_E = -torch.log(P_new) + torch.log(P)
+                #tau = torch.exp(-delta_E / T)
 
-            tau = (P_new / P)**(1/T)
-            v = torch.rand(1, device=device)
+                tau = (P_new / P)**(1/T)
+                v = torch.rand(1, device=device)
 
-            if (v > tau) or (P_new < P):
-                new_candidates[idx] = batch_candidates[idx]
+                if (v > tau) or (P_new < P):
+                    new_candidates[idx] = batch_candidates[idx]
 
         return new_candidates
 
+    def batch_candidate_switch(self, p_1, p_2, batch_candidates, addition_labels, T, projection):
+        with torch.no_grad():
+            device = ltn.device
+            eps = 1e-8
+
+            # Current candidates
+            d1 = batch_candidates[:, 0]
+            d2 = batch_candidates[:, 1]
+
+            if projection == 'random':
+                new_candidates = self.sampler.batch_sample(addition_labels)
+            elif projection == 'mcmc':
+                new_candidates = self.projection.batch_propose_neighbor(d1, addition_labels)
+
+            new_d1 = new_candidates[:, 0]
+            new_d2 = new_candidates[:, 1]
+
+            p_d1 = torch.gather(p_1, 1, d1.unsqueeze(1))
+            p_d2 = torch.gather(p_2, 1, d2.unsqueeze(1))
+
+            new_p_d1 = torch.gather(p_1, 1, new_d1.unsqueeze(1))
+            new_p_d2 = torch.gather(p_2, 1, new_d2.unsqueeze(1))
+
+            P = p_d1 * p_d2 + eps
+            P_new = new_p_d1 * new_p_d2 + eps
+            tau = (P_new / P)**(1/T)
+            v = torch.rand(tau.shape, device=device)
+            mask = (v > tau) | (P_new < P)
+
+            res = torch.where(mask, batch_candidates, new_candidates)
+
+        return res 
+
     def f1_macro_multiclass(self, y_true, y_pred):
         classes = torch.unique(y_true)
-        f1_per_class = []
+        C = len(classes)
 
-        for c in classes:
-            tp = torch.sum((y_pred == c) & (y_true == c)).float()
-            fp = torch.sum((y_pred == c) & (y_true != c)).float()
-            fn = torch.sum((y_pred != c) & (y_true == c)).float()
+        # (C, N) boolean masks
+        pred_mask = y_pred.unsqueeze(0) == classes.unsqueeze(1)  # (C, N)
+        true_mask = y_true.unsqueeze(0) == classes.unsqueeze(1)  # (C, N)
 
-            precision = tp / (tp + fp + 1e-8)
-            recall = tp / (tp + fn + 1e-8)
+        tp = (pred_mask & true_mask).sum(dim=1).float()   # (C,)
+        fp = (pred_mask & ~true_mask).sum(dim=1).float()  # (C,)
+        fn = (~pred_mask & true_mask).sum(dim=1).float()  # (C,)
 
-            f1 = 2 * precision * recall / (precision + recall + 1e-8)
-            f1_per_class.append(f1)
+        precision = tp / (tp + fp + 1e-8)
+        recall    = tp / (tp + fn + 1e-8)
+        f1        = 2 * precision * recall / (precision + recall + 1e-8)
 
-        return torch.mean(torch.stack(f1_per_class))
+        return f1.mean()

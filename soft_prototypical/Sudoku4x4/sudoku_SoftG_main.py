@@ -1,19 +1,15 @@
 import ltn
 import torch
 import math
-import random
-import numpy as np
 import torch.nn.functional as F
 from sklearn.metrics import f1_score
-
-projection = ([0,0,1,1,2,2,3,3],[2,3,2,3,0,1,0,1])
-proj_index = {'1':[(0,0), (0,1)], '2': [(0,0), (1,0)], '3': [(1,0), (1,1)], '4':[(0,1), (1,1)], '5': [(0,0),(1,1)], \
-         '6':[(2,2), (2,3)], '7': [(2,2), (3,2)], '8': [(3,2), (3,3)], '9':[(2,3), (3,3)], '10': [(2,2),(3,3)]}
 
 from backbones.Sudoku4x4.CNN_Sudoku import MNISTConv
 from samplers.Sudoku4x4.sudoku4x4_sampler import Sampler
 from projections.Sudoku4x4.projection_sudoku4x4 import Projection
 from ltn_utils.Sudoku4x4.ltn_utils_sudoku4x4 import Logic
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class Soft_Sudoku:
     def __init__(self, num_classes, layer_sizes=(512, 256, 100, 10)):
@@ -24,9 +20,6 @@ class Soft_Sudoku:
         self.projection = Projection()
         self.boards_cache = {}
         self.alpha = 0.05
-        #self.projection = ([0,0,1,1,2,2,3,3],[2,3,2,3,0,1,0,1])
-        self.proj_index = {'1':[(0,0), (0,1)], '2': [(0,0), (1,0)], '3': [(1,0), (1,1)], '4':[(0,1), (1,1)], '5': [(0,0),(1,1)], \
-         '6':[(2,2), (2,3)], '7': [(2,2), (3,2)], '8': [(3,2), (3,3)], '9':[(2,3), (3,3)], '10': [(2,2),(3,3)]}
 
     def train(self, train_loader, test_loader, epochs, schedule):
         optimizer = torch.optim.Adam(self.cnn_s_d.parameters(), lr=0.001)
@@ -35,6 +28,7 @@ class Soft_Sudoku:
 
         t = 1
         T = T0 = 1
+        K = 144
 
         train_digit_accs = []
         test_digit_accs = []
@@ -44,6 +38,8 @@ class Soft_Sudoku:
         test_digit_f1s = []
         train_board_f1s = []
         test_board_f1s = []
+
+        board_candidate_cache = torch.zeros((len(train_loader.dataset), K, 4, 4), dtype=torch.long).to(device) #[dataset_size, K, 4, 4]
 
         for epoch in range(epochs):
             train_loss = 0.0
@@ -62,81 +58,56 @@ class Soft_Sudoku:
             test_correct_logic_match = 0
 
             p = min(10, 2 + 2*(epoch // 2))
+            self.cnn_s_d.train()
             for batch_idx, (board_images, board_labels, digit_labels, sample_idx) in enumerate(train_loader):
-                self.cnn_s_d.train()
                 optimizer.zero_grad()
                 board_images = board_images.to(ltn.device) #[64, 4, 4, 1, 28, 28]
                 board_labels = board_labels.to(ltn.device) #[64]
                 digit_labels = digit_labels.to(ltn.device) #[64, 4, 4]
+                sample_idx = sample_idx.to(ltn.device) #[64]
 
                 B, N, _ = digit_labels.shape
-
-                sat_board_mask = (board_labels == 1)
-                unsat_board_mask = (board_labels == 0)
-
                 board_images_reshape = board_images.reshape(B*N*N, 1, 28, 28)
-                p_digits, features_digits = self.cnn_s_d(board_images_reshape)
-                p_digits_reshape = p_digits.reshape(B, N*N, self.num_classes)
-                p_digits_squared = p_digits.reshape(B, N, N, -1)
+                p_digits, _ = self.cnn_s_d(board_images_reshape) #[B*N*N, num_classes]
+                p_digits_reshape = p_digits.reshape(B, N*N, self.num_classes) #[B, 16, num_classes]
 
-                if epoch < sampling_epoch:
-                  latent_boards = self.get_latent(p_digits_squared, board_labels)
+                logic_labels = (board_labels == 1) #[B]
+                idx_sat = sample_idx[logic_labels]
+                idx_unsat = sample_idx[~logic_labels]
 
-                  for i, idx in enumerate(sample_idx):
-                      self.boards_cache[idx.item()] = latent_boards[i]
+                if epoch == 0:
+                    board_candidate_cache[idx_sat] = self.sampler.tensor_sat_sample_batch(len(idx_sat), K)  #[B, K, 4, 4]
+                    board_candidate_cache[idx_unsat] = self.sampler.tensor_unsat_sample_batch(len(idx_unsat), K)  #[B, K, 4, 4]
+                elif epoch > sampling_epoch:
+                    # For later epochs, we can use the model's current predictions to generate new candidates
+                    board_candidate_cache[idx_sat] = self.switch_k_candidate(p_digits_reshape[logic_labels], board_candidate_cache[idx_sat], T, sat=True)
+                    board_candidate_cache[idx_unsat] = self.switch_k_candidate(p_digits_reshape[~logic_labels], board_candidate_cache[idx_unsat], T, sat=False)
+                batch_candidates = board_candidate_cache[sample_idx]  #[B, K, 4, 4]
 
-                elif epoch >= sampling_epoch:
-                  batch_boards_list = [self.boards_cache[idx.item()].clone() for idx in sample_idx]
-                  batch_boards = torch.stack(batch_boards_list).to(device=ltn.device)
-                  latent_boards = self.switch_latent(p_digits_squared, board_labels, batch_boards, T)
+                target_digits = (batch_candidates - 1).reshape(B, K, N*N)
+                # CrossEntropyLoss expects targets in [0, num_classes-1]. Sudoku digits are 1..4.
+                CE_loss = self.k_entropy_loss(p_digits.reshape(B, N*N, self.num_classes), target_digits)
 
-                  for i, idx in enumerate(sample_idx):
-                      self.boards_cache[idx.item()] = latent_boards[i]
-                else:
-                  batch_boards_list = [self.boards_cache[idx.item()].clone() for idx in sample_idx]
-                  latent_boards = torch.stack(batch_boards_list).to(device=ltn.device)
-                
-                latent_board_reshape = latent_boards.reshape(B, N*N)
-                features_digits = features_digits.reshape(B, N*N, -1)
-                solved_features = features_digits[sat_board_mask]
-
-                sat_AtomicSudoku = self.logical.SudokuTruth_atomic(p_digits_reshape, latent_board_reshape, p)
-                #sat_features = self.logical.neg_SudokuTruth_features(solved_features, p)
-
-                #CE_loss = criterion(p_digits, (latent_boards-1).reshape(B*N*N))
-
-                total_loss = (1. - sat_AtomicSudoku)
+                total_loss = CE_loss
 
                 total_loss.backward()
                 optimizer.step()
                 train_loss += total_loss.item()
 
-                pred_digits = torch.argmax(p_digits, dim=1).reshape(B*N*N)
+                pred_digits = torch.argmax(p_digits, dim=-1).reshape(B*N*N)
                 true_digits = (digit_labels-1).reshape(B*N*N)
-                latent_digits = (latent_boards-1).reshape(B*N*N)
 
                 correct_digits = (pred_digits == true_digits).detach()
-                correct_latent = (latent_digits == true_digits).detach()
 
                 correct_train += correct_digits.sum().item()
-                correct_train_latent += correct_latent.sum().item()
                 total_train += correct_digits.numel()
-
-                # --- 1. Digit Metrics Preparation ---
-                #pred_digits = torch.argmin(dist, dim=-1).reshape(-1)
-                #true_digits = (digit_labels-1).reshape(-1)
 
                 all_pred_digits.extend(pred_digits.cpu().numpy())
                 all_true_digits.extend(true_digits.cpu().numpy())
 
-                pred_boards = (pred_digits.reshape(B, N, N) + 1).cpu().numpy()
-                logical_preds = []
-
-                for i in range(B):
-                    is_valid = self.sampler.check_sudoku_4x4(pred_boards[i].tolist())
-                    logical_preds.append(1 if is_valid else 0)
+                pred_boards = (pred_digits.reshape(B, N, N) + 1)
                 
-                logical_preds = torch.tensor(logical_preds).to(ltn.device)
+                logical_preds = self.sampler.tensor_check(pred_boards).to(device)  #[B]
 
                 all_pred_boards.append(logical_preds)
                 all_true_boards.append(board_labels)
@@ -155,8 +126,9 @@ class Soft_Sudoku:
             all_pred_boards = []
             all_true_boards = []
 
+            self.cnn_s_d.eval()
             for batch_idx, (board_images, board_labels, digit_labels, sample_idx) in enumerate(test_loader):
-                self.cnn_s_d.eval()
+                
                 with torch.no_grad():
                     board_images = board_images.to(ltn.device)
                     board_labels = board_labels.to(ltn.device)
@@ -177,14 +149,9 @@ class Soft_Sudoku:
                     all_pred_digits.extend(pred_digits.cpu().numpy())
                     all_true_digits.extend(true_digits.cpu().numpy())
 
-                    pred_boards = (pred_digits.reshape(B, N, N) + 1).cpu().numpy()
-                    logical_preds = []
+                    pred_boards = (pred_digits.reshape(B, N, N) + 1)
 
-                    for i in range(B):
-                        is_valid = self.sampler.check_sudoku_4x4(pred_boards[i].tolist())
-                        logical_preds.append(1 if is_valid else 0)
-
-                    logical_preds = torch.tensor(logical_preds).to(ltn.device)
+                    logical_preds = self.sampler.tensor_check(pred_boards).to(device)  #[B]
 
                     all_pred_boards.append(logical_preds)
                     all_true_boards.append(board_labels)
@@ -240,70 +207,6 @@ class Soft_Sudoku:
             'test_board_f1s':test_board_f1s
         }
 
-    def switch_latent(self, p_digits, board_labels, batch_boards, T):
-        B, _, _, N = p_digits.shape
-        with torch.no_grad():
-          board_costs = -torch.log(p_digits)
-          K = 40
-
-          for i, b_label in enumerate(board_labels):
-            #samples = random.sample(self.sampler.sat_boards_cache, k=K)
-            old_energy = self.board_energy(board_costs[i], batch_boards[i])
-            if b_label.item() == 1:
-                rand_samples = random.sample(self.sampler.sat_boards_cache, k=K)
-                pro_samples = self.projection.mutate_sudoku_4x4(batch_boards[i].detach())
-                samples = pro_samples + rand_samples
-                new_board, new_energy = self.solve_board_assignment(p_digits[i], board_labels[i], samples)
-            else:
-                rand_samples = random.sample(self.sampler.sat_boards_cache, k=K)
-                pro_samples = self.projection.mutate_sudoku_4x4(batch_boards[i].detach())
-                samples = pro_samples + rand_samples
-                new_board, new_energy = self.solve_board_assignment(p_digits[i], board_labels[i], samples)
-                new_board = self.sampler.generate_unsat_board(new_board)
-
-            delta = -new_energy + old_energy
-            v = random.random()
-            try:
-                tau = math.exp(delta / T)
-            except:
-                tau = 1.0
-            
-            if new_energy < old_energy  or v < tau:
-                batch_boards[i] = torch.tensor(new_board)
-
-        return batch_boards
-
-    def get_latent(self, p_digits, board_labels):
-        B, _, _, N = p_digits.shape
-        with torch.no_grad():
-          boards = []
-          K = 144
-          for i, b_label in enumerate(board_labels):
-              if b_label.item() == 1:
-                samples = random.sample(self.sampler.sat_boards_cache, k=K)
-                board, _ = self.solve_board_assignment(p_digits[i], board_labels[i], samples)
-              else:
-                samples = random.sample(self.sampler.sat_boards_cache, k=K)
-                board, _ = self.solve_board_assignment(p_digits[i], board_labels[i], samples)
-                board = self.sampler.generate_unsat_board(board)
-
-              boards.append(board)
-
-          boards = np.array(boards)
-          boards = torch.tensor(boards).to(device=ltn.device)
-
-        return boards
-
-    def solve_board_assignment(self, p_digits, board_label, samples):
-        _, _, N = p_digits.shape
-        board_costs = -torch.log(p_digits)
-        costs = []
-        for s in samples:
-            costs.append(self.board_energy(board_costs, s))
-
-        min_idx = np.argmin(costs)
-        return samples[min_idx], costs[min_idx]
-
     def board_energy(self, board_costs, sample):
         _, _, N = board_costs.shape
         total_energy = 0.0
@@ -312,3 +215,87 @@ class Soft_Sudoku:
                 total_energy += board_costs[i, j, sample[i, j] - 1].item()
 
         return total_energy
+
+    def compute_energy_batch(self, logits, labels):
+        log_p = torch.log_softmax(logits, dim=-1)
+
+        B, K, _, _ = labels.shape
+        labels_flat = (labels - 1).view(B, K, -1)  # [B, K, 16]
+
+        log_p_expanded = log_p.unsqueeze(1).expand(-1, K, -1, -1)  # [B, K, N, C]
+
+        gathered_logp = torch.gather(
+            log_p_expanded,
+            -1,
+            labels_flat.unsqueeze(-1)
+        ).squeeze(-1)  # [B, K, N]
+        energy = -gathered_logp.mean(dim=-1)  # [B, K]
+
+        return energy
+    
+    def switch_k_candidate(self, logits, old_samples, T, sat=True):
+        with torch.no_grad():
+            B, K, _, _ = old_samples.shape
+            if sat:
+                new_samples = self.projection.tensorized_mutate_sudoku_4x4(old_samples)  #[B, K, 4, 4]
+            else:
+                new_samples = self.projection.tensorized_mutate_sudoku_4x4(old_samples)
+            
+            old_loss = self.compute_energy_batch(logits, old_samples)
+            new_loss = self.compute_energy_batch(logits, new_samples)
+
+            delta = -new_loss + old_loss
+            v = torch.rand(B, K).to(device)
+
+            try:
+                tau = torch.exp(torch.clamp(delta / T, max=0))
+            except:
+                tau = torch.ones_like(v)
+            
+            accept_mask = (new_loss < old_loss) | (v < tau)
+            accept_mask_expanded = accept_mask.unsqueeze(-1).unsqueeze(-1)  # [B, K, 1, 1]
+            final_samples = torch.where(accept_mask_expanded, new_samples, old_samples) #type: ignore .long()  # [B, K, 4, 4]
+
+            return final_samples
+
+    def k_entropy_loss(self, logits, samples):
+        """
+        Instead of free-energy over all K candidates,
+        pick the single lowest-energy grounding and apply standard cross-entropy.
+        
+        logits:  [B, N*N, num_classes]  (raw log-probs or logits from log_softmax)
+        samples: [B, K, N*N]            (candidate digit labels, 0-indexed)
+        """
+        B, K, L = samples.shape
+
+        log_p = torch.log_softmax(logits, dim=-1)  # [B, L, C]
+
+        # Expand for gather: [B, K, L, C]
+        log_p_expanded = log_p.unsqueeze(1).expand(-1, K, -1, -1)
+
+        # Gather log-probs of each candidate digit at each position
+        gathered_logp = torch.gather(
+            log_p_expanded,
+            -1,
+            samples.unsqueeze(-1)          # [B, K, L, 1]
+        ).squeeze(-1)                       # [B, K, L]
+
+        # Energy = negative mean log-prob over positions
+        energy = -gathered_logp.mean(dim=-1)  # [B, K]
+
+        # Pick the lowest-energy (highest likelihood) candidate per sample
+        best_idx = energy.argmin(dim=-1)      # [B]
+
+        # Gather the best candidate labels: [B, L]
+        best_idx_expanded = best_idx.view(B, 1, 1).expand(B, 1, L)
+        best_candidates = torch.gather(samples, 1, best_idx_expanded).squeeze(1)  # [B, L]
+
+        # Standard cross-entropy against the best candidate
+        # logits is [B, L, C] → need [B, C, L] for F.cross_entropy
+        loss = F.cross_entropy(
+            logits.permute(0, 2, 1),   # [B, C, L]
+            best_candidates,           # [B, L]  (class indices)
+            reduction='mean'
+        )
+
+        return loss

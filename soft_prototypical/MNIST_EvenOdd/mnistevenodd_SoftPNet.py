@@ -11,23 +11,27 @@ from backbones.MNIST_EvenOdd.PNet_MNISTEvenOdd import LearnableProtoNet_CNN
 from samplers.MNIST_EvenOdd.mnistevenodd_sampler import Sampler
 from projections.MNIST_EvenOdd.projection_mnistevenodd import Projection
 from ltn_utils.MNIST_EvenOdd.ltn_utils_mnistevenodd import Logic
+from soft_prototypical.MNIST_EvenOdd.sensitivity import SensitivityAnalyzer
 
 class LTN_SoftProto_MNISTEvenOdd:
-    def __init__(self, num_classes, anchor_imgs, layer_sizes=(512, 256, 100, 10)):
+    def __init__(self, num_classes, anchor_imgs, verbose):
         #self.protonet = LearnableProtoNet_CNN_MNIST(num_classes=num_classes, layer_sizes=layer_sizes).to(ltn.device)
         self.protonet = LearnableProtoNet_CNN(num_classes=num_classes).to(ltn.device)
         self.sampler = Sampler()
         self.projection = Projection()
         self.logical = Logic()
         self.num_classes = num_classes
+        self.verbose = verbose
         self.anchor_imgs = anchor_imgs.to(ltn.device)
         self.addition_candidate_cache = {}
         self.alpha = 0.2
 
-    def train(self, train_loader, test_loader, epochs, schedule):
+    def train(self, train_loader, test_loader, epochs, schedule, projection):
         optimizer = torch.optim.Adam(self.protonet.parameters(), lr=0.001)
         #optimizer = torch.optim.SGD(self.protonet.parameters(), lr=0.001, momentum=0.9, weight_decay=1e-4)
         criterion = torch.nn.CrossEntropyLoss()
+
+        addition_candidate_cache = torch.empty((len(train_loader.dataset), 2), dtype=torch.long, device=ltn.device)
 
         train_sats = []
         test_sats = []
@@ -71,6 +75,7 @@ class LTN_SoftProto_MNISTEvenOdd:
                 addition_labels, mult_labels = addition_labels.to(ltn.device), mult_labels.to(ltn.device)
                 operand1_labels, operand2_labels = operand1_labels.to(ltn.device), operand2_labels.to(ltn.device)
                 operand_images = operand_images.to(ltn.device)
+                sample_idx = sample_idx.to(ltn.device)
                 image_x, image_y = operand_images[:, 0], operand_images[:, 1]
 
                 z_x = self.protonet(image_x)
@@ -92,15 +97,13 @@ class LTN_SoftProto_MNISTEvenOdd:
 
                 if epoch < sampling_epoch: #best results just with the get_latent_sample
                     #latent_digits = self.get_latent(anchorp_x, anchorp_y, addition_labels)
-                    latent_digits = self.get_latent_sample(anchorp_x, anchorp_y, addition_labels)
-                    for i, (idx) in enumerate(sample_idx):
-                        if idx.item() not in self.addition_candidate_cache:
-                            self.addition_candidate_cache[idx.item()] = latent_digits[i]
-                else:
-                    latent_digits = torch.stack([self.addition_candidate_cache[idx.item()] for idx in sample_idx])
-                    new_latent_digits = self.switch_latent(anchorp_x, anchorp_y, latent_digits, addition_labels, T)
-                    for i, (idx) in enumerate(sample_idx):
-                        self.addition_candidate_cache[idx.item()] = new_latent_digits[i]
+                    latent_digits = self.sampler.batch_sample(addition_labels)
+                    addition_candidate_cache[sample_idx] = latent_digits
+                elif epoch >= sampling_epoch:
+                    latent_digits = addition_candidate_cache[sample_idx]
+                    new_latent_digits = self.batch_candidate_switch(anchorp_x, anchorp_y, latent_digits, addition_labels, T, projection)
+                    addition_candidate_cache[sample_idx] = new_latent_digits.to(ltn.device)
+                    latent_digits = new_latent_digits
 
                 latent_digits = latent_digits.to(ltn.device)
                 logical_loss = self.logical.addition_proto_logic(p_x, p_y, latent_digits)
@@ -108,10 +111,9 @@ class LTN_SoftProto_MNISTEvenOdd:
                 z_digits = torch.cat([z_x, z_y], dim=0)
                 latent_digits_reshape = torch.cat([latent_digits[:,0], latent_digits[:,1]], dim=0)
 
-                new_proto_loss = self.prototype_loss(z_digits, latent_digits_reshape)
+                proto_loss = self.prototype_loss(z_digits, latent_digits_reshape)
 
-
-                total_loss = 0.6 * new_proto_loss + logical_loss
+                total_loss = 0.6 * proto_loss + logical_loss
 
                 total_loss.backward()
                 optimizer.step()
@@ -129,7 +131,7 @@ class LTN_SoftProto_MNISTEvenOdd:
                 train_acc += torch.count_nonzero(torch.eq(addition_labels, sum_pred)) / sum_pred.shape[0]
                 all_joint_true_sum.append(addition_labels.detach())
                 all_joint_pred_sum.append(sum_pred.detach())
-                train_f1 += self.f1_macro_multiclass(addition_labels, sum_pred, 2 * self.num_classes - 1).item()
+                train_f1 += self.f1_macro_multiclass(addition_labels, sum_pred).item()
 
                 train_opeand1_acc += torch.count_nonzero(torch.eq(operand1_labels, pred_x)) / (pred_x.shape[0])
                 train_opeand2_acc += torch.count_nonzero(torch.eq(operand2_labels, pred_y)) / (pred_x.shape[0])
@@ -153,12 +155,12 @@ class LTN_SoftProto_MNISTEvenOdd:
             all_joint_true = torch.cat(all_joint_true)
             all_joint_pred = torch.cat(all_joint_pred)
             all_joint_pred_latent = torch.cat(all_joint_pred_latent)
-            train_operands_f1 = self.f1_macro_multiclass(all_joint_true, all_joint_pred, self.num_classes**2).item()
-            train_operands_latent_f1 = self.f1_macro_multiclass(all_joint_true, all_joint_pred_latent, self.num_classes**2).item()
+            train_operands_f1 = self.f1_macro_multiclass(all_joint_true, all_joint_pred).item()
+            train_operands_latent_f1 = self.f1_macro_multiclass(all_joint_true, all_joint_pred_latent).item()
 
             all_joint_pred_sum = torch.cat(all_joint_pred_sum)
             all_joint_true_sum = torch.cat(all_joint_true_sum)
-            train_f1 = self.f1_macro_multiclass(all_joint_true_sum, all_joint_pred_sum, 2 * self.num_classes - 1).item()
+            train_f1 = self.f1_macro_multiclass(all_joint_true_sum, all_joint_pred_sum).item()
 
             train_loss = train_loss / len(train_loader)
 
@@ -197,11 +199,11 @@ class LTN_SoftProto_MNISTEvenOdd:
 
             all_joint_true = torch.cat(all_joint_true)
             all_joint_pred = torch.cat(all_joint_pred)
-            test_operands_f1 = self.f1_macro_multiclass(all_joint_true, all_joint_pred, self.num_classes**2).item()
+            test_operands_f1 = self.f1_macro_multiclass(all_joint_true, all_joint_pred).item()
 
             all_joint_pred_sum = torch.cat(all_joint_pred_sum)
             all_joint_true_sum = torch.cat(all_joint_true_sum)
-            test_f1 = self.f1_macro_multiclass(all_joint_true_sum, all_joint_pred_sum, 2 * self.num_classes - 1).item()
+            test_f1 = self.f1_macro_multiclass(all_joint_true_sum, all_joint_pred_sum).item()
 
             train_sat = 0.0 #compute_sat_level(train_loader, logical.proto_truth_cifar10_weighted, self.protonet).item()
             test_sat = 0.0 #compute_sat_level(test_loader, logical.proto_truth_weighted_2, self.protonet, self.protonet.prototypes).item()
@@ -231,6 +233,14 @@ class LTN_SoftProto_MNISTEvenOdd:
             if epoch%1 == 0:
                 print(" epoch %d | loss %.4f | Train Acc %.3f | Test Acc %.3f | Train Operands Acc %.3f | Test Operands Acc %.3f | Train Operands F1 %.3f | Test Operands F1 %.3f | Train Latent Operands F1 %.3f"
                     %(epoch, train_loss, train_acc, test_acc, train_opeands_acc, test_opeands_acc, train_operands_f1, test_operands_f1, train_operands_latent_f1))
+        
+        analyzer = SensitivityAnalyzer(self.protonet, self.num_classes, verbose=self.verbose, device=ltn.device)
+        sensitivity_results = analyzer.run_full_analysis(
+            data_loader=test_loader,
+            anchor_imgs=self.anchor_imgs,
+            n_batches=30,
+        )
+
         return{
             'train_accs':train_accs,
             'test_accs':test_accs,
@@ -242,115 +252,132 @@ class LTN_SoftProto_MNISTEvenOdd:
             'test_operands_f1s':test_operands_f1s,
             'embedding':self.protonet.embedding,
             'prototypes':self.protonet.prototypes.cpu().detach().numpy(),
+            'sensitivity': sensitivity_results,
         }
 
-    def get_latent_sample(self, p_x, p_y, addition_labels):
-        B, C = p_x.shape
-        with torch.no_grad():
-          pairs = []
-          for i in range(B):
-              n = addition_labels[i].item()
-              samples = self.sampler.pairs_cache[n]
-              d_x, d_y = self.solve_addition_assignment_sample(p_x[i], p_y[i], samples)
-              pairs.append((d_x, d_y))
+    def is_valid_digit_pair(self, d_x, d_y):
+        return 0 <= d_x < self.num_classes and 0 <= d_y < self.num_classes
 
-          pairs = torch.tensor(pairs)
 
-        return pairs
-
-    def f1_macro_multiclass(self, y_true, y_pred, num_classes):
+    def f1_macro_multiclass(self, y_true, y_pred):
         classes = torch.unique(y_true)
-        f1_per_class = []
+        C = len(classes)
 
-        for c in classes:
-            tp = torch.sum((y_pred == c) & (y_true == c)).float()
-            fp = torch.sum((y_pred == c) & (y_true != c)).float()
-            fn = torch.sum((y_pred != c) & (y_true == c)).float()
+        # (C, N) boolean masks
+        pred_mask = y_pred.unsqueeze(0) == classes.unsqueeze(1)  # (C, N)
+        true_mask = y_true.unsqueeze(0) == classes.unsqueeze(1)  # (C, N)
 
-            precision = tp / (tp + fp + 1e-8)
-            recall = tp / (tp + fn + 1e-8)
+        tp = (pred_mask & true_mask).sum(dim=1).float()   # (C,)
+        fp = (pred_mask & ~true_mask).sum(dim=1).float()  # (C,)
+        fn = (~pred_mask & true_mask).sum(dim=1).float()  # (C,)
 
-            f1 = 2 * precision * recall / (precision + recall + 1e-8)
-            f1_per_class.append(f1)
+        precision = tp / (tp + fp + 1e-8)
+        recall    = tp / (tp + fn + 1e-8)
+        f1        = 2 * precision * recall / (precision + recall + 1e-8)
 
-        return torch.mean(torch.stack(f1_per_class))
+        return f1.mean()
 
-    def solve_addition_assignment_sample(self, prob_x, prob_y, sample):
-
-        costs_x = [-math.log(p.item() + 1e-8) for p in prob_x]
-        costs_y = [-math.log(p.item() + 1e-8) for p in prob_y]
-
-        costs = []
-        for s in sample:
-          d1, d2 = s
-          costs.append(costs_x[d1] + costs_y[d2])
-
-        min_idx = np.argmin(costs)
-        return sample[min_idx]
-
-    def switch_latent(self, p_x, p_y, latent_digits, addition_labels, T):
+    def switch_latent(self, p_x, p_y, latent_digits, addition_labels, T, projection):
         B, C = latent_digits.shape
         with torch.no_grad():
-          new_latent_digits = []
-          for i in range(B):
-              n = addition_labels[i].item()
-              d_x, d_y = latent_digits[i, 0].item(), latent_digits[i, 1].item()
-              new_d_x, new_d_y = self.projection.propose_neighbor(d_x, n) #random.choice(self.pairs_cache[n]) #self.propose_neighbor(d_x, n)
-              P = - torch.log(p_x[i, d_x]+ 1e-8) - torch.log(p_y[i, d_y]+ 1e-8)
-              P_new = - torch.log(p_x[i, new_d_x] + 1e-8) - torch.log(p_y[i, new_d_y] + 1e-8)
+            new_latent_digits = []
+            for i in range(B):
+                n = addition_labels[i].item()
+                d_x, d_y = latent_digits[i, 0].item(), latent_digits[i, 1].item()
 
-              delta = -P_new + P
-              tau = torch.exp(delta / T)
-              v = torch.rand(1, device=ltn.device)
+                if projection == 'random':
+                    new_d_x, new_d_y = random.choice(self.sampler.pairs_cache[n])
+                elif projection == 'mcmc':
+                    new_d_x, new_d_y = self.projection.propose_neighbor(d_x, n) #random.choice(self.pairs_cache[n]) #self.propose_neighbor(d_x, n)
+         
+                P = - torch.log(p_x[i, d_x]+ 1e-8) - torch.log(p_y[i, d_y]+ 1e-8)
+                P_new = - torch.log(p_x[i, new_d_x] + 1e-8) - torch.log(p_y[i, new_d_y] + 1e-8)
 
-              if P_new < P or v < tau:
-                  new_latent_digits.append((new_d_x, new_d_y))
-              else:
-                  new_latent_digits.append((d_x, d_y))
+                delta = -P_new + P
+                tau = torch.exp(delta / T)
+                v = torch.rand(1, device=ltn.device)
 
-          new_latent_digits = torch.tensor(new_latent_digits)
+                if P_new < P or v < tau:
+                    new_latent_digits.append((new_d_x, new_d_y))
+                else:
+                    new_latent_digits.append((d_x, d_y))
+
+            new_latent_digits = torch.tensor(new_latent_digits)
         return new_latent_digits
 
+    def batch_candidate_switch(self, p_1, p_2, batch_candidates, addition_labels, T, projection):
+        with torch.no_grad():
+            device = ltn.device
+            eps = 1e-8
+
+            # Current candidates
+            d1 = batch_candidates[:, 0]
+            d2 = batch_candidates[:, 1]
+
+            if projection == 'random':
+                new_candidates = self.sampler.batch_sample(addition_labels)
+            elif projection == 'mcmc':
+                new_candidates = self.projection.batch_propose_neighbor(d1, addition_labels)
+
+            new_d1 = new_candidates[:, 0]
+            new_d2 = new_candidates[:, 1]
+
+            p_d1 = torch.gather(p_1, 1, d1.unsqueeze(1))
+            p_d2 = torch.gather(p_2, 1, d2.unsqueeze(1))
+
+            new_p_d1 = torch.gather(p_1, 1, new_d1.unsqueeze(1))
+            new_p_d2 = torch.gather(p_2, 1, new_d2.unsqueeze(1))
+
+            P = p_d1 * p_d2 + eps
+            P_new = new_p_d1 * new_p_d2 + eps
+            tau = (P_new / P)**(1/T)
+            v = torch.rand(tau.shape, device=device)
+            mask = (v > tau) | (P_new < P)
+
+            res = torch.where(mask, batch_candidates, new_candidates)
+
+        return res 
+    
     def prototype_loss(self, z_digits, batch_pairs):
+        total_loss = 0.0
 
-      total_loss = 0.0
+        centroids = {}
+        z_queries = {}
+        p_norm = F.normalize(self.protonet.prototypes, dim=-1)
+        z_digits = F.normalize(z_digits, dim=-1)
+        for i in range(self.num_classes):
+            z_i = z_digits[batch_pairs == i]
+            n_i = z_i.shape[0]
+            if n_i > 2:
+                idx = torch.randperm(n_i)
+                q_idx = idx[: n_i // 2]
+                s_idx = idx[n_i // 2 :]
 
-      centroids = {}
-      z_queries = {}
-      p_norm = F.normalize(self.protonet.prototypes, dim=-1)
-      z_digits = F.normalize(z_digits, dim=-1)
-      for i in range(self.num_classes):
-          z_i = z_digits[batch_pairs == i]
-          n_i = z_i.shape[0]
-          if n_i > 2:
-              idx = torch.randperm(n_i)
-              q_idx = idx[: n_i // 2]
-              s_idx = idx[n_i // 2 :]
+                z_support = z_i[s_idx]
+                z_query   = z_i[q_idx]
 
-              z_support = z_i[s_idx]
-              z_query   = z_i[q_idx]
+                c_i = torch.mean(z_support, dim=0)
 
-              c_i = torch.mean(z_support, dim=0)
+                class_loss = torch.mean((z_query - c_i) ** 2)
 
-              class_loss = torch.mean((z_query - c_i) ** 2)
+                proto_loss = torch.mean((c_i - p_norm[i]) ** 2)
 
-              proto_loss = torch.mean((c_i - p_norm[i]) ** 2)
+                total_loss += class_loss + proto_loss
 
-              total_loss += class_loss + proto_loss
+                z_queries[i] = z_query
+                centroids[i] = c_i
 
-              z_queries[i] = z_query
-              centroids[i] = c_i
+        if False:
+            eps = 1e-8
+            for i, q_i in z_queries.items():
+                repel_loss = 0.0
+                for j, c_j in centroids.items():
+                    if i != j:
+                        #dist = torch.mean((q_i - p_norm[j]) ** 2)
+                        dist = torch.mean((q_i - c_j) ** 2)
+                        repel_loss += torch.exp(-dist)
 
-      eps = 1e-8
-      for i, q_i in z_queries.items():
-          repel_loss = 0.0
-          for j, c_j in centroids.items():
-              if i != j:
-                  #dist = torch.mean((q_i - p_norm[j]) ** 2)
-                  dist = torch.mean((q_i - c_j) ** 2)
-                  repel_loss += torch.exp(-dist)
+                repel_loss = torch.log(repel_loss + eps)
+                total_loss += repel_loss
 
-          repel_loss = torch.log(repel_loss + eps)
-          total_loss += repel_loss
-
-      return total_loss / len(centroids)
+        return total_loss / len(centroids)

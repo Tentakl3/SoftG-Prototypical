@@ -1,8 +1,39 @@
 import torch
 import random
 import numpy as np
-from .mnist_sudoku_loader import get_mnist_digit_board, get_anchor_mnist_digit, load_mnist_by_digit
+from samplers.Sudoku4x4.sudoku4x4_sampler import Sampler
+from .mnist_sudoku_loader import get_mnist_digit_board, get_anchor_mnist_digit, load_mnist_by_digit, tensorized_load_mnist_by_digit, tensorized_get_mnist_digit_board, tensorized_get_anchor_mnist_digit
 from .sudoku_builder import generate_boards_set
+
+sampler = Sampler()
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def tensorized_split_boards(n_train, n_test):
+    sat_train_boards = sampler.tensor_sat_sample_batch(n_train // 2).squeeze(1) #[n_train, 4, 4]
+    sat_train_labels = torch.ones(n_train // 2, dtype=torch.long).to(device) #[n_train // 2]
+    sat_test_boards = sampler.tensor_sat_sample_batch(n_test // 2).squeeze(1)
+    sat_test_labels = torch.ones(n_test // 2, dtype=torch.long).to(device) #[n_test // 2]
+
+    unsat_train_boards = sampler.tensor_unsat_sample_batch(n_train // 2).squeeze(1)
+    unsat_test_boards = sampler.tensor_unsat_sample_batch(n_test // 2).squeeze(1)
+    unsat_train_labels = torch.zeros(n_train // 2, dtype=torch.long).to(device) #[n_train // 2]
+    unsat_test_labels = torch.zeros(n_test // 2, dtype=torch.long).to(device) #[n_test // 2]
+
+    train_boards = torch.cat([sat_train_boards, unsat_train_boards], dim=0) #[n_train, 4, 4]
+    train_labels = torch.cat([sat_train_labels, unsat_train_labels], dim=0) #[n_train]
+    test_boards = torch.cat([sat_test_boards, unsat_test_boards], dim=0) #[n_test, 4, 4]
+    test_labels = torch.cat([sat_test_labels, unsat_test_labels], dim=0) #[n_test]
+
+    return train_boards, train_labels, test_boards, test_labels
+
+def tensorized_build_dataset(train_boards, test_boards):
+    by_digit_train, by_digit_test = tensorized_load_mnist_by_digit()
+
+    anchor_digits = tensorized_get_anchor_mnist_digit(by_digit_train)
+
+    train_imgs = tensorized_get_mnist_digit_board(train_boards, by_digit_train)
+    test_imgs = tensorized_get_mnist_digit_board(test_boards, by_digit_test)
+
+    return train_imgs, test_imgs, anchor_digits
 
 def split_boards(boards, n_train, n_test):
     rng = np.random.default_rng()
@@ -70,3 +101,27 @@ def get_mnist_sudoku4x4_dataset(n_train=100, n_test=25, batch_size=64):
     )
 
     return train_loader, test_loader, anchor_digits
+
+def tensorized_get_mnist_sudoku4x4_dataset(n_train=100, n_test=25, batch_size=64):
+
+    train_boards, train_labels, test_boards, test_labels = tensorized_split_boards(n_train, n_test)
+    train_imgs, test_imgs, anchor_digits = tensorized_build_dataset(train_boards, test_boards)
+
+    train_idx = torch.arange(n_train)
+    test_idx = torch.arange(n_test)
+
+    train_set = torch.utils.data.TensorDataset(train_imgs, train_labels, train_boards, train_idx)
+    test_set = torch.utils.data.TensorDataset(test_imgs, test_labels, test_boards, test_idx)
+
+    train_loader = torch.utils.data.DataLoader(
+        train_set, batch_size=batch_size, shuffle=True
+    )
+    test_loader = torch.utils.data.DataLoader(
+        test_set, batch_size=batch_size, shuffle=False
+    )
+
+    return train_loader, test_loader, anchor_digits
+
+if __name__ == '__main__':
+    train_loader, test_loader, anchor_digits = tensorized_get_mnist_sudoku4x4_dataset(n_train=100, n_test=1000, batch_size=64)
+    print(train_loader.dataset[0])

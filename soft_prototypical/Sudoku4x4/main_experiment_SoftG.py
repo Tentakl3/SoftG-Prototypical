@@ -5,18 +5,18 @@ import numpy as np
 import pickle
 
 
-from databuilder.Sudoku4x4.sudoku_loader import get_mnist_sudoku4x4_dataset
+from databuilder.Sudoku4x4.sudoku_loader import get_mnist_sudoku4x4_dataset, tensorized_get_mnist_sudoku4x4_dataset
 from .sudoku_SoftG_main import Soft_Sudoku
 
 if __name__ == '__main__':
     print(torch.cuda.is_available())
     #50 100 300 500
-    train_loader, test_loader, anchor_digits = get_mnist_sudoku4x4_dataset(n_train=300, n_test=1000, batch_size=64)
+    train_loader, test_loader, anchor_digits = tensorized_get_mnist_sudoku4x4_dataset(n_train=300, n_test=1000, batch_size=64)
     #schedules = ["exp", "linear", "log"]
     schedules = ["log"]
     for schedule in schedules:
         results_tries = {}
-        for i in range(10):
+        for i in range(1):
             seed = i*128
             random.seed(seed)
             np.random.seed(seed)
