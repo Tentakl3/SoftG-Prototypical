@@ -13,7 +13,7 @@ from projections.MNIST_EvenOdd.projection_mnistevenodd import Projection
 from ltn_utils.MNIST_EvenOdd.ltn_utils_mnistevenodd import Logic
 from soft_prototypical.MNIST_EvenOdd.sensitivity import SensitivityAnalyzer
 
-class LTN_SoftProto_MNISTEvenOdd:
+class SoftProto_MNISTEvenOdd:
     def __init__(self, num_classes, anchor_imgs, verbose):
         #self.protonet = LearnableProtoNet_CNN_MNIST(num_classes=num_classes, layer_sizes=layer_sizes).to(ltn.device)
         self.protonet = LearnableProtoNet_CNN(num_classes=num_classes).to(ltn.device)
@@ -23,10 +23,9 @@ class LTN_SoftProto_MNISTEvenOdd:
         self.num_classes = num_classes
         self.verbose = verbose
         self.anchor_imgs = anchor_imgs.to(ltn.device)
-        self.addition_candidate_cache = {}
         self.alpha = 0.2
 
-    def train(self, train_loader, test_loader, epochs, schedule, projection):
+    def train(self, train_loader, test_loader, epochs, schedule, projection, criteria):
         optimizer = torch.optim.Adam(self.protonet.parameters(), lr=0.001)
         #optimizer = torch.optim.SGD(self.protonet.parameters(), lr=0.001, momentum=0.9, weight_decay=1e-4)
         criterion = torch.nn.CrossEntropyLoss()
@@ -85,7 +84,6 @@ class LTN_SoftProto_MNISTEvenOdd:
 
                 T = max(0.1, 1.0 * math.exp(-epoch / 10))
 
-                z = torch.cat([z_x, z_y], dim=0)
                 z_anchor = self.protonet(self.anchor_imgs)
 
                 anchorp_x = torch.softmax(-torch.cdist(z_x, z_anchor), dim=1)
@@ -101,8 +99,8 @@ class LTN_SoftProto_MNISTEvenOdd:
                     addition_candidate_cache[sample_idx] = latent_digits
                 elif epoch >= sampling_epoch:
                     latent_digits = addition_candidate_cache[sample_idx]
-                    new_latent_digits = self.batch_candidate_switch(anchorp_x, anchorp_y, latent_digits, addition_labels, T, projection)
-                    addition_candidate_cache[sample_idx] = new_latent_digits.to(ltn.device)
+                    new_latent_digits = self.batch_candidate_switch(anchorp_x, anchorp_y, latent_digits, addition_labels, T, projection, criteria)
+                    addition_candidate_cache[sample_idx] = new_latent_digits.to(ltn.device)    
                     latent_digits = new_latent_digits
 
                 latent_digits = latent_digits.to(ltn.device)
@@ -233,13 +231,17 @@ class LTN_SoftProto_MNISTEvenOdd:
             if epoch%1 == 0:
                 print(" epoch %d | loss %.4f | Train Acc %.3f | Test Acc %.3f | Train Operands Acc %.3f | Test Operands Acc %.3f | Train Operands F1 %.3f | Test Operands F1 %.3f | Train Latent Operands F1 %.3f"
                     %(epoch, train_loss, train_acc, test_acc, train_opeands_acc, test_opeands_acc, train_operands_f1, test_operands_f1, train_operands_latent_f1))
-        
-        analyzer = SensitivityAnalyzer(self.protonet, self.num_classes, verbose=self.verbose, device=ltn.device)
-        sensitivity_results = analyzer.run_full_analysis(
-            data_loader=test_loader,
-            anchor_imgs=self.anchor_imgs,
-            n_batches=30,
-        )
+                    
+        analyze = True
+        if analyze == True:
+            analyzer = SensitivityAnalyzer(self.protonet, self.num_classes, verbose=self.verbose, device=ltn.device)
+            sensitivity_results = analyzer.run_full_analysis(
+                data_loader=test_loader,
+                anchor_imgs=self.anchor_imgs,
+                n_batches=30,
+            )
+        else:
+            sensitivity_results = None
 
         return{
             'train_accs':train_accs,
@@ -285,9 +287,9 @@ class LTN_SoftProto_MNISTEvenOdd:
                 n = addition_labels[i].item()
                 d_x, d_y = latent_digits[i, 0].item(), latent_digits[i, 1].item()
 
-                if projection == 'random':
+                if projection == 'off':
                     new_d_x, new_d_y = random.choice(self.sampler.pairs_cache[n])
-                elif projection == 'mcmc':
+                elif projection == 'on':
                     new_d_x, new_d_y = self.projection.propose_neighbor(d_x, n) #random.choice(self.pairs_cache[n]) #self.propose_neighbor(d_x, n)
          
                 P = - torch.log(p_x[i, d_x]+ 1e-8) - torch.log(p_y[i, d_y]+ 1e-8)
@@ -305,7 +307,7 @@ class LTN_SoftProto_MNISTEvenOdd:
             new_latent_digits = torch.tensor(new_latent_digits)
         return new_latent_digits
 
-    def batch_candidate_switch(self, p_1, p_2, batch_candidates, addition_labels, T, projection):
+    def batch_candidate_switch(self, p_1, p_2, batch_candidates, addition_labels, T, projection, criteria):
         with torch.no_grad():
             device = ltn.device
             eps = 1e-8
@@ -314,9 +316,9 @@ class LTN_SoftProto_MNISTEvenOdd:
             d1 = batch_candidates[:, 0]
             d2 = batch_candidates[:, 1]
 
-            if projection == 'random':
+            if projection == 'off':
                 new_candidates = self.sampler.batch_sample(addition_labels)
-            elif projection == 'mcmc':
+            elif projection == 'on':
                 new_candidates = self.projection.batch_propose_neighbor(d1, addition_labels)
 
             new_d1 = new_candidates[:, 0]
@@ -332,7 +334,11 @@ class LTN_SoftProto_MNISTEvenOdd:
             P_new = new_p_d1 * new_p_d2 + eps
             tau = (P_new / P)**(1/T)
             v = torch.rand(tau.shape, device=device)
-            mask = (v > tau) | (P_new < P)
+
+            if criteria == 'greedy':
+                mask = P_new < P
+            elif criteria == 'mcmc':
+                mask = (v > tau) | (P_new < P)
 
             res = torch.where(mask, batch_candidates, new_candidates)
 
@@ -366,18 +372,5 @@ class LTN_SoftProto_MNISTEvenOdd:
 
                 z_queries[i] = z_query
                 centroids[i] = c_i
-
-        if False:
-            eps = 1e-8
-            for i, q_i in z_queries.items():
-                repel_loss = 0.0
-                for j, c_j in centroids.items():
-                    if i != j:
-                        #dist = torch.mean((q_i - p_norm[j]) ** 2)
-                        dist = torch.mean((q_i - c_j) ** 2)
-                        repel_loss += torch.exp(-dist)
-
-                repel_loss = torch.log(repel_loss + eps)
-                total_loss += repel_loss
 
         return total_loss / len(centroids)

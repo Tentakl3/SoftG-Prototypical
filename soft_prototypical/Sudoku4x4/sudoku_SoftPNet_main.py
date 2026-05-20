@@ -12,8 +12,6 @@ from ltn_utils.Sudoku4x4.ltn_utils_sudoku4x4 import Logic
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-
 class SoftGPNet_Sudoku:
     def __init__(self, num_classes, layer_sizes=(512, 256, 100, 10), anchor_digits=None):
         self.protonet = LearnableProtoNet_CNN(num_classes=num_classes).to(ltn.device)
@@ -25,7 +23,7 @@ class SoftGPNet_Sudoku:
         self.boards_cache = {}
         self.alpha = 0.8
 
-    def train(self, train_loader, test_loader, epochs, schedule):
+    def train(self, train_loader, test_loader, epochs, schedule, projection, criteria):
         optimizer = torch.optim.Adam(self.protonet.parameters(), lr=0.001)
         criterion = torch.nn.CrossEntropyLoss()
         anchor_images = self.anchor_digits.to(device) if self.anchor_digits is not None else None
@@ -43,8 +41,11 @@ class SoftGPNet_Sudoku:
         test_digit_f1s = []
         train_board_f1s = []
         test_board_f1s = []
+        train_times = []
 
         board_candidate_cache = torch.zeros((len(train_loader.dataset), K, 4, 4), dtype=torch.long).to(device) #[dataset_size, K, 4, 4]
+        start_time = torch.cuda.Event(enable_timing=True)
+        end_time = torch.cuda.Event(enable_timing=True)
 
         for epoch in range(epochs):
             train_loss = 0.0
@@ -98,8 +99,8 @@ class SoftGPNet_Sudoku:
                     board_candidate_cache[idx_unsat] = self.sampler.tensor_unsat_sample_batch(len(idx_unsat), K)  #[B, K, 4, 4]
                 elif epoch > sampling_epoch:
                     # For later epochs, we can use the model's current predictions to generate new candidates
-                    board_candidate_cache[idx_sat] = self.switch_k_candidate(p_digits[logic_labels], board_candidate_cache[idx_sat], T, sat=True)
-                    board_candidate_cache[idx_unsat] = self.switch_k_candidate(p_digits[~logic_labels], board_candidate_cache[idx_unsat], T, sat=False)
+                    board_candidate_cache[idx_sat] = self.switch_k_candidate(p_digits[logic_labels], board_candidate_cache[idx_sat], T, projection, criteria, sat=True)
+                    board_candidate_cache[idx_unsat] = self.switch_k_candidate(p_digits[~logic_labels], board_candidate_cache[idx_unsat], T, projection, criteria, sat=False)
                 batch_candidates = board_candidate_cache[sample_idx]  #[B, K, 4, 4]
 
                 target_digits = (batch_candidates - 1).reshape(B, K, N*N)
@@ -144,6 +145,10 @@ class SoftGPNet_Sudoku:
 
                 train_correct_logic_match += (logical_preds == board_labels).sum().item()
                 train_total_boards += B
+
+            end_time.record()
+            torch.cuda.synchronize()
+            train_times.append(start_time.elapsed_time(end_time)/1000)
 
             all_pred_boards = torch.cat(all_pred_boards).detach().cpu().numpy()
             all_true_boards = torch.cat(all_true_boards).detach().cpu().numpy()
@@ -232,7 +237,7 @@ class SoftGPNet_Sudoku:
                 t+=1
                 T = max(0.01, T0)
 
-            if epoch % 1 == 0:
+            if epoch % 19 == 0:
             #if epoch == 9:
                 print(" epoch %d | loss %.4f | Train Board Acc %.4f | Train Board F1 %.4f | Train Digit Acc %.4f | Train Digit F1 %.4f | Test Board Acc %.4f | Test Board F1 %.4f | Test Digit Acc %.4f | Test Digit F1 %.4f | Latent Digit Acc %.4f"
                     %(epoch, train_loss, train_board_acc, train_board_f1, train_digit_acc, train_digit_f1, test_board_acc, test_board_f1, test_digit_acc, test_digit_f1, train_latent_acc))
@@ -246,7 +251,9 @@ class SoftGPNet_Sudoku:
             'train_digit_f1s':train_digit_f1s,
             'test_digit_f1s':test_digit_f1s,
             'train_board_f1s':train_board_f1s,
-            'test_board_f1s':test_board_f1s
+            'test_board_f1s':test_board_f1s,
+            'train_latent_acc':train_latent_acc,
+            'train_times':train_times
         }
 
     def board_energy(self, board_costs, sample):
@@ -275,15 +282,19 @@ class SoftGPNet_Sudoku:
 
         return energy
     
-    def switch_k_candidate(self, logits, old_samples, T, sat=True):
+    def switch_k_candidate(self, logits, old_samples, T, projection, criteria,sat=True):
         with torch.no_grad():
             B, K, _, _ = old_samples.shape
             if sat:
-                #new_samples = self.projection.tensorized_mutate_sudoku_4x4(old_samples)  #[B, K, 4, 4]
-                new_samples = self.sampler.tensor_sat_sample_batch(B, K)  #[B, K, 4, 4]
+                if projection == 'on':
+                    new_samples = self.projection.tensorized_mutate_sudoku_4x4(old_samples)  #[B, K, 4, 4]
+                elif projection == 'off':
+                    new_samples = self.sampler.tensor_sat_sample_batch(B*K, 1).reshape(B, K, 4, 4)  #[B, K, 4, 4]
             else:
-                #new_samples = self.projection.tensorized_mutate_sudoku_4x4(old_samples)
-                new_samples = self.sampler.tensor_unsat_sample_batch(B, K)  #[B, K, 4, 4]
+                if projection == 'on':
+                    new_samples = self.projection.tensorized_mutate_sudoku_4x4(old_samples)  #[B, K, 4, 4]
+                elif projection == 'off':
+                    new_samples = self.sampler.tensor_unsat_sample_batch(B*K, 1).reshape(B, K, 4, 4)  #[B, K, 4, 4]
             
             old_loss = self.compute_energy_batch(logits, old_samples)
             new_loss = self.compute_energy_batch(logits, new_samples)
@@ -295,6 +306,11 @@ class SoftGPNet_Sudoku:
                 tau = torch.exp(torch.clamp(delta / T, max=0))
             except:
                 tau = torch.ones_like(v)
+
+            if criteria == 'greedy':
+                accept_mask = (new_loss < old_loss)
+            elif criteria == 'mcmc':
+                accept_mask = (new_loss < old_loss) | (v < tau)
             
             accept_mask = (new_loss < old_loss) | (v < tau)
             accept_mask_expanded = accept_mask.unsqueeze(-1).unsqueeze(-1)  # [B, K, 1, 1]

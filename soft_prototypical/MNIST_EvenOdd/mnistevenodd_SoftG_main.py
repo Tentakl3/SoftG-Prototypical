@@ -9,7 +9,7 @@ from samplers.MNIST_EvenOdd.mnistevenodd_sampler import Sampler
 from projections.MNIST_EvenOdd.projection_mnistevenodd import Projection
 from ltn_utils.MNIST_EvenOdd.ltn_utils_mnistevenodd import Logic
 
-class LTN_SoftG_MNISTEvenOdd:
+class SoftG_MNISTEvenOdd:
     def __init__(self, num_classes, layer_sizes=(512, 256, 100, 10)):
         self.num_classes = num_classes
         self.cnn_s_d = SingleDigitClassifier()
@@ -19,7 +19,7 @@ class LTN_SoftG_MNISTEvenOdd:
         self.logical = Logic()
         self.alpha = 0.2
 
-    def train(self, train_loader, test_loader, epochs, schedule, projection):
+    def train(self, train_loader, test_loader, epochs, schedule, projection, criteria):
         optimizer = torch.optim.Adam(self.Digit_s_d.parameters(), lr=0.001)
         #optimizer = torch.optim.SGD(self.protonet.parameters(), lr=0.001, momentum=0.9, weight_decay=1e-4)
         criterion = torch.nn.CrossEntropyLoss()
@@ -79,7 +79,7 @@ class LTN_SoftG_MNISTEvenOdd:
                 p_2 = torch.softmax(self.cnn_s_d(operand_images[:, 1]), dim=1)
 
                 if epoch >= sampling_epoch:
-                    batch_candidates = self.batch_candidate_switch(p_1, p_2, batch_candidates.clone(), addition_labels, T, projection)
+                    batch_candidates = self.batch_candidate_switch(p_1, p_2, batch_candidates.clone(), addition_labels, T, projection, criteria)
 
                 sat = self.logical.addition_logic(self.Digit_s_d, operand_images, batch_candidates, addition_labels)
 
@@ -253,7 +253,7 @@ class LTN_SoftG_MNISTEvenOdd:
 
         return new_candidates
 
-    def batch_candidate_switch(self, p_1, p_2, batch_candidates, addition_labels, T, projection):
+    def batch_candidate_switch(self, p_1, p_2, batch_candidates, addition_labels, T, projection, criteria):
         with torch.no_grad():
             device = ltn.device
             eps = 1e-8
@@ -262,9 +262,9 @@ class LTN_SoftG_MNISTEvenOdd:
             d1 = batch_candidates[:, 0]
             d2 = batch_candidates[:, 1]
 
-            if projection == 'random':
+            if projection == 'off':
                 new_candidates = self.sampler.batch_sample(addition_labels)
-            elif projection == 'mcmc':
+            elif projection == 'on':
                 new_candidates = self.projection.batch_propose_neighbor(d1, addition_labels)
 
             new_d1 = new_candidates[:, 0]
@@ -280,7 +280,11 @@ class LTN_SoftG_MNISTEvenOdd:
             P_new = new_p_d1 * new_p_d2 + eps
             tau = (P_new / P)**(1/T)
             v = torch.rand(tau.shape, device=device)
-            mask = (v > tau) | (P_new < P)
+
+            if criteria == 'greedy':
+                mask = P_new < P
+            elif criteria == 'mcmc':
+                mask = (v > tau) | (P_new < P)
 
             res = torch.where(mask, batch_candidates, new_candidates)
 
