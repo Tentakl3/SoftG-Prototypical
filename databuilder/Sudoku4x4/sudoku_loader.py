@@ -8,20 +8,42 @@ from .sudoku_builder import generate_boards_set
 sampler = Sampler()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 def tensorized_split_boards(n_train, n_test):
-    sat_train_boards = sampler.tensor_sat_sample_batch(n_train // 2).squeeze(1) #[n_train, 4, 4]
-    sat_train_labels = torch.ones(n_train // 2, dtype=torch.long).to(device) #[n_train // 2]
-    sat_test_boards = sampler.tensor_sat_sample_batch(n_test // 2).squeeze(1)
-    sat_test_labels = torch.ones(n_test // 2, dtype=torch.long).to(device) #[n_test // 2]
+    # NOTE(corr-6): the original tensorized path called
+    # `sampler.tensor_sat_sample_batch(n_train // 2)` and
+    # `sampler.tensor_sat_sample_batch(n_test // 2)` separately. Both use
+    # `torch.randint` with replacement on the SAT cache, so train and test
+    # could (and did) share board configurations — leaking label-relevant
+    # information into the test set. Fix: shuffle the SAT cache once,
+    # slice disjoint train/test windows. UNSAT side is corruption-derived
+    # from independently-drawn SAT boards, so we mirror the same disjoint
+    # split there.
+    sat_pool = sampler.sat_boards_cache.clone()         # [N_sat, 4, 4]
+    n_sat = sat_pool.shape[0]
+    half_train = n_train // 2
+    half_test = n_test // 2
+    # Cap if requested sizes exceed pool capacity.
+    if half_train + half_test > n_sat:
+        half_test = max(0, n_sat - half_train)
+    perm = torch.randperm(n_sat, device=device)
+    sat_train_idx = perm[:half_train]
+    sat_test_idx = perm[half_train:half_train + half_test]
+    sat_train_boards = sat_pool[sat_train_idx]
+    sat_test_boards = sat_pool[sat_test_idx]
+    sat_train_labels = torch.ones(half_train, dtype=torch.long).to(device)
+    sat_test_labels = torch.ones(half_test, dtype=torch.long).to(device)
 
-    unsat_train_boards = sampler.tensor_unsat_sample_batch(n_train // 2).squeeze(1)
-    unsat_test_boards = sampler.tensor_unsat_sample_batch(n_test // 2).squeeze(1)
-    unsat_train_labels = torch.zeros(n_train // 2, dtype=torch.long).to(device) #[n_train // 2]
-    unsat_test_labels = torch.zeros(n_test // 2, dtype=torch.long).to(device) #[n_test // 2]
+    # UNSAT side: use the same per-side count via the existing batched
+    # corrupted-board generator. These are independent of the SAT train/test
+    # split because the corruption operator is stochastic per call.
+    unsat_train_boards = sampler.tensor_unsat_sample_batch(half_train).squeeze(1)
+    unsat_test_boards = sampler.tensor_unsat_sample_batch(half_test).squeeze(1)
+    unsat_train_labels = torch.zeros(half_train, dtype=torch.long).to(device)
+    unsat_test_labels = torch.zeros(half_test, dtype=torch.long).to(device)
 
-    train_boards = torch.cat([sat_train_boards, unsat_train_boards], dim=0) #[n_train, 4, 4]
-    train_labels = torch.cat([sat_train_labels, unsat_train_labels], dim=0) #[n_train]
-    test_boards = torch.cat([sat_test_boards, unsat_test_boards], dim=0) #[n_test, 4, 4]
-    test_labels = torch.cat([sat_test_labels, unsat_test_labels], dim=0) #[n_test]
+    train_boards = torch.cat([sat_train_boards, unsat_train_boards], dim=0)
+    train_labels = torch.cat([sat_train_labels, unsat_train_labels], dim=0)
+    test_boards = torch.cat([sat_test_boards, unsat_test_boards], dim=0)
+    test_labels = torch.cat([sat_test_labels, unsat_test_labels], dim=0)
 
     return train_boards, train_labels, test_boards, test_labels
 

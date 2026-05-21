@@ -47,9 +47,14 @@ class LearnableProtoNet_CNN(torch.nn.Module):
         # Embedding network
         self.embedding = ProtoNet(z_dim=z_dim)
 
-        self.prototypes = torch.nn.Parameter(
-                torch.randn(num_classes, z_dim)
-            ).to(ltn.device)
+        # NOTE(corr-14): the original line was
+        #     self.prototypes = nn.Parameter(torch.randn(...)).to(ltn.device)
+        # but `Parameter.to(device)` returns a plain Tensor (not a Parameter)
+        # whenever the device move is not a no-op. On GPU this silently
+        # demoted the result so it was never registered in self._parameters
+        # and never updated by the optimizer. Letting the surrounding module
+        # `.to(device)` call move the parameter preserves the Parameter type.
+        self.prototypes = torch.nn.Parameter(torch.randn(num_classes, z_dim))
 
     def forward(self, x):
         x = self.embedding(x)

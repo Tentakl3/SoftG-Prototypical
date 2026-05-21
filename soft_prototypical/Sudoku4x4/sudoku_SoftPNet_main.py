@@ -77,7 +77,12 @@ class SoftGPNet_Sudoku:
                 B, N, _ = digit_labels.shape
                 board_images_reshape = board_images.reshape(B*N*N, 1, 28, 28)
                 z_digits = self.protonet(board_images_reshape)
-                z_anchor = self.protonet(anchor_images)
+                # NOTE(corr-11): anchor forward in eval mode so the small
+                # anchor set (4 examples) doesn't drive noisy BN batch-stats.
+                self.protonet.eval()
+                with torch.no_grad():
+                    z_anchor = self.protonet(anchor_images)
+                self.protonet.train()
 
                 z_digits_reshape = z_digits.reshape(B, N*N, -1)
                 z_digits_reshape = F.normalize(z_digits_reshape, dim=-1)
