@@ -344,14 +344,20 @@ class SoftProto_MNISTEvenOdd:
             tau = (P_new / P)**(1/T)
             v = torch.rand(tau.shape, device=device)
 
+            # NOTE(corr-22): mirrors corr-2 fix in the SoftG trainer. The previous
+            # `(v > tau) | (P_new < P)` reverted on every worse-likelihood proposal
+            # regardless of v — greedy hill-climbing, broken detailed balance.
+            # Correct Metropolis revert mask: worse AND random rejects, i.e.
+            # (v > tau) AND (P_new < P). corr-2 fixed SoftG; this companion fix
+            # applies the same to SoftPNet.
             if criteria == 'greedy':
                 mask = P_new < P
             elif criteria == 'mcmc':
-                mask = (v > tau) | (P_new < P)
+                mask = (v > tau) & (P_new < P)
 
             res = torch.where(mask, batch_candidates, new_candidates)
 
-        return res 
+        return res
     
     def prototype_loss(self, z_digits, batch_pairs):
         total_loss = 0.0
