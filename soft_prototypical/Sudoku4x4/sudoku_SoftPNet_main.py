@@ -46,6 +46,11 @@ class SoftGPNet_Sudoku:
         board_candidate_cache = torch.zeros((len(train_loader.dataset), K, 4, 4), dtype=torch.long).to(device) #[dataset_size, K, 4, 4]
         start_time = torch.cuda.Event(enable_timing=True)
         end_time = torch.cuda.Event(enable_timing=True)
+        # NOTE(corr-25): start_time was never .record()'d before the epoch loop
+        # in this trainer (the SoftG trainer already does this), so the later
+        # call to start_time.elapsed_time(end_time) raised
+        # RuntimeError("Both events must be recorded before calculating elapsed time").
+        start_time.record()
 
         for epoch in range(epochs):
             train_loss = 0.0
