@@ -134,7 +134,19 @@ class SoftGPNet_Sudoku:
                     best_target_digits_flat + 1 # [B*16], values in 1..4, ground truth
                 )
 
-                total_loss = (1- self.alpha) * CE_loss  + self.alpha * (proto_loss)
+                # NOTE(corr-26): without this term the prototypes were only
+                # pulled toward MCMC's best-of-K guess, which is a permutation-
+                # symmetric solution under the Sudoku constraint (row/col/box
+                # distinct holds under any digit relabelling). The model thus
+                # learned to predict permuted digits and digit accuracy stayed
+                # at chance (~25 % for 4 classes) even though board accuracy
+                # rose to 0.94. Anchoring prototype i directly to the embedding
+                # of the single labelled anchor image for class i+1 grounds the
+                # digit identity. Single anchor per class is consistent with
+                # our paper's setting.
+                proto_anchor_loss = ((F.normalize(z_anchor, dim=-1) - p_norm) ** 2).mean()
+
+                total_loss = (1- self.alpha) * CE_loss  + self.alpha * (proto_loss + proto_anchor_loss)
 
                 total_loss.backward()
                 optimizer.step()
