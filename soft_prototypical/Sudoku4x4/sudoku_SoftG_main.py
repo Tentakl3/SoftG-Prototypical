@@ -12,12 +12,17 @@ from ltn_utils.Sudoku4x4.ltn_utils_sudoku4x4 import Logic
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class Soft_Sudoku:
-    def __init__(self, num_classes, layer_sizes=(512, 256, 100, 10)):
+    def __init__(self, num_classes, layer_sizes=(512, 256, 100, 10), anchor_digits=None):
         self.cnn_s_d = MNISTConv(linear_layers_sizes=(256, 100, 84, num_classes)).to(ltn.device)
         self.num_classes = num_classes
         self.sampler = Sampler()
         self.logical = Logic()
         self.projection = Projection()
+        # NOTE(corr-28): anchor_digits is one labelled MNIST image per digit
+        # class (1..num_classes), kept on the model for the anchor-supervised
+        # CE term added in the train loop. Optional for back-compat — when
+        # None the trainer behaves as before (pure CE on best-of-K MCMC).
+        self.anchor_digits = anchor_digits
         self.boards_cache = {}
         self.alpha = 0.05
 
@@ -91,7 +96,24 @@ class Soft_Sudoku:
                 # CrossEntropyLoss expects targets in [0, num_classes-1]. Sudoku digits are 1..4.
                 CE_loss, best_candidates = self.k_entropy_loss(p_digits.reshape(B, N*N, self.num_classes), target_digits)
 
-                total_loss = CE_loss
+                # NOTE(corr-28): supervised CE on the labelled anchor digits.
+                # Sudoku's row/col/box "distinct" constraint is permutation-
+                # symmetric, so MCMC's best-of-K candidate is permutation-
+                # consistent but identity-wrong. Pure CE on that target leaves
+                # digit accuracy at chance (~25 % for 4 classes) — classic
+                # reasoning shortcut (Andolfi & Giunchiglia, 2025). One
+                # labelled image per class is enough to break it.
+                if self.anchor_digits is not None:
+                    anchor_imgs = self.anchor_digits.to(ltn.device)
+                    anchor_logits, _ = self.cnn_s_d(anchor_imgs)
+                    anchor_sup_loss = criterion(
+                        anchor_logits,
+                        torch.arange(self.num_classes, device=ltn.device),
+                    )
+                else:
+                    anchor_sup_loss = torch.zeros((), device=ltn.device)
+
+                total_loss = CE_loss + anchor_sup_loss
 
                 total_loss.backward()
                 optimizer.step()
