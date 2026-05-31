@@ -8,15 +8,9 @@ from .sudoku_builder import generate_boards_set
 sampler = Sampler()
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 def tensorized_split_boards(n_train, n_test):
-    # NOTE(corr-6): the original tensorized path called
-    # `sampler.tensor_sat_sample_batch(n_train // 2)` and
-    # `sampler.tensor_sat_sample_batch(n_test // 2)` separately. Both use
-    # `torch.randint` with replacement on the SAT cache, so train and test
-    # could (and did) share board configurations — leaking label-relevant
-    # information into the test set. Fix: shuffle the SAT cache once,
-    # slice disjoint train/test windows. UNSAT side is corruption-derived
-    # from independently-drawn SAT boards, so we mirror the same disjoint
-    # split there.
+    # NOTE(corr-6): the original split sampled SAT boards with replacement
+    # for train and test separately, allowing leakage; we shuffle once and
+    # slice disjoint windows.
     sat_pool = sampler.sat_boards_cache.clone()         # [N_sat, 4, 4]
     n_sat = sat_pool.shape[0]
     half_train = n_train // 2

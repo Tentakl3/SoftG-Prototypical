@@ -46,10 +46,8 @@ class SoftGPNet_Sudoku:
         board_candidate_cache = torch.zeros((len(train_loader.dataset), K, 4, 4), dtype=torch.long).to(device) #[dataset_size, K, 4, 4]
         start_time = torch.cuda.Event(enable_timing=True)
         end_time = torch.cuda.Event(enable_timing=True)
-        # NOTE(corr-25): start_time was never .record()'d before the epoch loop
-        # in this trainer (the SoftG trainer already does this), so the later
-        # call to start_time.elapsed_time(end_time) raised
-        # RuntimeError("Both events must be recorded before calculating elapsed time").
+        # NOTE(corr-25): `start_time.record()` was missing, so the call to
+        # `start_time.elapsed_time(end_time)` raised at the first epoch end.
         start_time.record()
 
         for epoch in range(epochs):
@@ -82,12 +80,9 @@ class SoftGPNet_Sudoku:
                 B, N, _ = digit_labels.shape
                 board_images_reshape = board_images.reshape(B*N*N, 1, 28, 28)
                 z_digits = self.protonet(board_images_reshape)
-                # NOTE(corr-11 + corr-27): anchor forward in eval mode so the small
-                # anchor set (4 examples) doesn't drive noisy BN batch-stats.
-                # corr-27 needs gradients to flow back through z_anchor for the
-                # supervised anchor classification loss below, so the no_grad
-                # wrapper that corr-11 originally used is removed — eval mode
-                # alone is sufficient to silence the BN jitter.
+                # NOTE(corr-11+corr-27): eval mode suppresses BN jitter on the
+                # small anchor batch; no_grad removed so the encoder receives
+                # gradients from the supervised anchor term below.
                 self.protonet.eval()
                 z_anchor = self.protonet(anchor_images)
                 self.protonet.train()
@@ -97,14 +92,11 @@ class SoftGPNet_Sudoku:
                 z_anchor = F.normalize(z_anchor, dim=-1)
 
                 dist = torch.cdist(z_digits_reshape, p_norm) #[B, 16, 4]
-                # NOTE(corr-23): keep `score = -dist` as raw "logits" for the
-                # MCMC energy + cross-entropy paths, so log_softmax and
-                # F.cross_entropy receive logits (not already-softmaxed
-                # probabilities). Passing `p_digits = softmax(-dist)` to
-                # F.cross_entropy double-softmaxed the input and gave a much
-                # smaller / mis-shaped gradient. `p_digits` is kept for argmax
-                # readout below (softmax-invariant).
-                score = -dist                          # [B, 16, 4]  raw logits
+                # NOTE(corr-23): pass raw logits (`-dist`) to the MCMC energy
+                # and the cross-entropy; the previous code fed softmax
+                # probabilities, causing a double softmax. `p_digits` is kept
+                # only for the argmax readout.
+                score = -dist
                 p_digits = torch.softmax(score, dim=-1)
 
                 anchor_dist = torch.cdist(z_digits_reshape, z_anchor) #[B, 16, 4]
@@ -137,30 +129,14 @@ class SoftGPNet_Sudoku:
                     best_target_digits_flat + 1 # [B*16], values in 1..4, ground truth
                 )
 
-                # NOTE(corr-26): without this term the prototypes were only
-                # pulled toward MCMC's best-of-K guess, which is a permutation-
-                # symmetric solution under the Sudoku constraint (row/col/box
-                # distinct holds under any digit relabelling). The model thus
-                # learned to predict permuted digits and digit accuracy stayed
-                # at chance (~25 % for 4 classes) even though board accuracy
-                # rose to 0.94. Anchoring prototype i directly to the embedding
-                # of the single labelled anchor image for class i+1 grounds the
-                # digit identity. Single anchor per class is consistent with
-                # our paper's setting.
+                # NOTE(corr-26): aligns prototypes with the labelled anchor
+                # embeddings rather than only the (permutation-symmetric)
+                # MCMC best-of-K.
                 proto_anchor_loss = ((F.normalize(z_anchor, dim=-1) - p_norm) ** 2).mean()
 
-                # NOTE(corr-27): direct supervised classification loss on the
-                # anchor images. By construction anchor_images[i] is a labelled
-                # example of digit class i+1 (per databuilder convention), so
-                # the encoder must produce z_anchor[i] closest to prototype[i].
-                # corr-26 alone wasn't enough — CE_loss on MCMC's best-of-K
-                # candidate dominates the encoder's gradient and pulls z(x)
-                # toward permutation-consistent (but identity-wrong) targets.
-                # This term gives the encoder one direct label per class — the
-                # minimal supervision needed to break the reasoning shortcut,
-                # matching the "one labelled datapoint per concept" setting of
-                # Andolfi & Giunchiglia (2025).
-                anchor_score = -torch.cdist(F.normalize(z_anchor, dim=-1), p_norm)  # [num_classes, num_classes]
+                # NOTE(corr-27): supervised cross-entropy on the labelled
+                # anchors; minimal grounding for digit identity.
+                anchor_score = -torch.cdist(F.normalize(z_anchor, dim=-1), p_norm)
                 anchor_sup_loss = F.cross_entropy(
                     anchor_score,
                     torch.arange(self.num_classes, device=device),
@@ -359,9 +335,8 @@ class SoftGPNet_Sudoku:
             except:
                 tau = torch.ones_like(v)
 
-            # NOTE(corr-16): the unconditional `accept_mask = (new_loss<old_loss) | (v<tau)`
-            # that previously followed the if/elif overwrote the greedy branch, so the
-            # `criteria='greedy'` ablation actually ran MCMC. Removed the overwrite.
+            # NOTE(corr-16): trailing assignment of `accept_mask` after the
+            # if/elif disabled the greedy branch; removed.
             if criteria == 'greedy':
                 accept_mask = (new_loss < old_loss)
             elif criteria == 'mcmc':
@@ -383,9 +358,8 @@ class SoftGPNet_Sudoku:
         """
         B, K, L = samples.shape
 
-        # NOTE(corr-23): logits are raw scores (-dist) now, so use log_softmax,
-        # not log(probs). The downstream F.cross_entropy(logits, ...) below
-        # also expects raw logits, so no further change needed there.
+        # NOTE(corr-23): `logits` are raw scores; use log_softmax rather
+        # than log(probs). F.cross_entropy below already expects raw logits.
         log_p = torch.log_softmax(logits, dim=-1)  # [B, L, C]
 
         # Expand for gather: [B, K, L, C]
