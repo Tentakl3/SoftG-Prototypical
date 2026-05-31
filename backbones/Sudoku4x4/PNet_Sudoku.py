@@ -47,9 +47,10 @@ class LearnableProtoNet_CNN(Module):
         # Embedding network
         self.embedding = ProtoNet(z_dim=z_dim)
 
-        self.prototypes = nn.Parameter(
-                torch.randn(num_classes, z_dim)
-            ).to(ltn.device)
+        # NOTE(corr-14): see PNet_MNISTEvenOdd.py for full rationale — the
+        # original `.to(ltn.device)` silently demoted Parameter→Tensor on GPU,
+        # leaving prototypes unregistered and never updated by the optimizer.
+        self.prototypes = nn.Parameter(torch.randn(num_classes, z_dim))
 
     def forward(self, x):
         x = self.embedding(x)

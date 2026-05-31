@@ -269,12 +269,15 @@ class Soft_Sudoku:
             except:
                 tau = torch.ones_like(v)
 
+            # NOTE(corr-16): the unconditional `accept_mask = (new_loss<old_loss) | (v<tau)`
+            # that previously followed the if/elif overwrote the greedy branch, so the
+            # `criteria='greedy'` ablation actually ran MCMC. Removed the overwrite.
             if criteria == 'greedy':
                 accept_mask = (new_loss < old_loss)
             elif criteria == 'mcmc':
                 accept_mask = (new_loss < old_loss) | (v < tau)
-            
-            accept_mask = (new_loss < old_loss) | (v < tau)
+            else:
+                accept_mask = (new_loss < old_loss) | (v < tau)
             accept_mask_expanded = accept_mask.unsqueeze(-1).unsqueeze(-1)  # [B, K, 1, 1]
             final_samples = torch.where(accept_mask_expanded, new_samples, old_samples) #type: ignore .long()  # [B, K, 4, 4]
 

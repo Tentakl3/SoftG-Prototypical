@@ -248,7 +248,9 @@ class SoftG_MNISTEvenOdd:
                 tau = (P_new / P)**(1/T)
                 v = torch.rand(1, device=device)
 
-                if (v > tau) or (P_new < P):
+                # NOTE(corr-2): legacy per-sample loop kept for backward compat.
+                # Corrected Metropolis (revert only when worse AND random rejects).
+                if (v > tau) and (P_new < P):
                     new_candidates[idx] = batch_candidates[idx]
 
         return new_candidates
@@ -281,10 +283,20 @@ class SoftG_MNISTEvenOdd:
             tau = (P_new / P)**(1/T)
             v = torch.rand(tau.shape, device=device)
 
+            # NOTE(corr-2): `mask` is the REVERT mask (where True we keep old).
+            # Correct Metropolis on a likelihood P (not energy):
+            #   - if P_new >= P (new is better-or-equal): always accept new
+            #   - if P_new < P  (new is worse):
+            #         accept with prob tau = (P_new/P)^(1/T)
+            #         → revert when v >= tau
+            # So revert iff (worse AND random rejects).
+            # The previous `(v > tau) | (P_new < P)` was an OR, which reverted
+            # even when v < tau as long as P_new < P → greedy hill-climbing,
+            # broken detailed balance.
             if criteria == 'greedy':
                 mask = P_new < P
             elif criteria == 'mcmc':
-                mask = (v > tau) | (P_new < P)
+                mask = (v > tau) & (P_new < P)
 
             res = torch.where(mask, batch_candidates, new_candidates)
 

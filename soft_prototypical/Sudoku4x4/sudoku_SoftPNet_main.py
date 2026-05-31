@@ -77,14 +77,27 @@ class SoftGPNet_Sudoku:
                 B, N, _ = digit_labels.shape
                 board_images_reshape = board_images.reshape(B*N*N, 1, 28, 28)
                 z_digits = self.protonet(board_images_reshape)
-                z_anchor = self.protonet(anchor_images)
+                # NOTE(corr-11): anchor forward in eval mode so the small
+                # anchor set (4 examples) doesn't drive noisy BN batch-stats.
+                self.protonet.eval()
+                with torch.no_grad():
+                    z_anchor = self.protonet(anchor_images)
+                self.protonet.train()
 
                 z_digits_reshape = z_digits.reshape(B, N*N, -1)
                 z_digits_reshape = F.normalize(z_digits_reshape, dim=-1)
                 z_anchor = F.normalize(z_anchor, dim=-1)
 
                 dist = torch.cdist(z_digits_reshape, p_norm) #[B, 16, 4]
-                p_digits = torch.softmax(-dist, dim=-1)
+                # NOTE(corr-23): keep `score = -dist` as raw "logits" for the
+                # MCMC energy + cross-entropy paths, so log_softmax and
+                # F.cross_entropy receive logits (not already-softmaxed
+                # probabilities). Passing `p_digits = softmax(-dist)` to
+                # F.cross_entropy double-softmaxed the input and gave a much
+                # smaller / mis-shaped gradient. `p_digits` is kept for argmax
+                # readout below (softmax-invariant).
+                score = -dist                          # [B, 16, 4]  raw logits
+                p_digits = torch.softmax(score, dim=-1)
 
                 anchor_dist = torch.cdist(z_digits_reshape, z_anchor) #[B, 16, 4]
                 anchorp_digits = torch.softmax(-anchor_dist, dim=-1)
@@ -99,12 +112,12 @@ class SoftGPNet_Sudoku:
                     board_candidate_cache[idx_unsat] = self.sampler.tensor_unsat_sample_batch(len(idx_unsat), K)  #[B, K, 4, 4]
                 elif epoch > sampling_epoch:
                     # For later epochs, we can use the model's current predictions to generate new candidates
-                    board_candidate_cache[idx_sat] = self.switch_k_candidate(p_digits[logic_labels], board_candidate_cache[idx_sat], T, projection, criteria, sat=True)
-                    board_candidate_cache[idx_unsat] = self.switch_k_candidate(p_digits[~logic_labels], board_candidate_cache[idx_unsat], T, projection, criteria, sat=False)
+                    board_candidate_cache[idx_sat] = self.switch_k_candidate(score[logic_labels], board_candidate_cache[idx_sat], T, projection, criteria, sat=True)
+                    board_candidate_cache[idx_unsat] = self.switch_k_candidate(score[~logic_labels], board_candidate_cache[idx_unsat], T, projection, criteria, sat=False)
                 batch_candidates = board_candidate_cache[sample_idx]  #[B, K, 4, 4]
 
                 target_digits = (batch_candidates - 1).reshape(B, K, N*N)
-                CE_loss = self.k_entropy_loss(p_digits, target_digits, T)
+                CE_loss = self.k_entropy_loss(score, target_digits, T)
 
                 z_digits_flat = z_digits_reshape.reshape(B*N*N, -1) #[B*16]
                 best_target_digits = self.get_best_candidate(anchorp_digits, target_digits)  #[B, 4, 4]
@@ -307,12 +320,15 @@ class SoftGPNet_Sudoku:
             except:
                 tau = torch.ones_like(v)
 
+            # NOTE(corr-16): the unconditional `accept_mask = (new_loss<old_loss) | (v<tau)`
+            # that previously followed the if/elif overwrote the greedy branch, so the
+            # `criteria='greedy'` ablation actually ran MCMC. Removed the overwrite.
             if criteria == 'greedy':
                 accept_mask = (new_loss < old_loss)
             elif criteria == 'mcmc':
                 accept_mask = (new_loss < old_loss) | (v < tau)
-            
-            accept_mask = (new_loss < old_loss) | (v < tau)
+            else:
+                accept_mask = (new_loss < old_loss) | (v < tau)
             accept_mask_expanded = accept_mask.unsqueeze(-1).unsqueeze(-1)  # [B, K, 1, 1]
             final_samples = torch.where(accept_mask_expanded, new_samples, old_samples) #type: ignore .long()  # [B, K, 4, 4]
 
@@ -322,12 +338,16 @@ class SoftGPNet_Sudoku:
         """
         Pick the single lowest-energy grounding and apply standard cross-entropy.
 
-        logits:  [B, N*N, num_classes]  (softmax probabilities from -dist)
+        logits:  [B, N*N, num_classes]  (raw scores = -dist, NOT probabilities,
+                                          see NOTE(corr-23) in train loop)
         samples: [B, K, N*N]            (candidate digit labels, 0-indexed)
         """
         B, K, L = samples.shape
 
-        log_p = torch.log(logits + 1e-8)  # [B, L, C]  — logits are probs, so log directly
+        # NOTE(corr-23): logits are raw scores (-dist) now, so use log_softmax,
+        # not log(probs). The downstream F.cross_entropy(logits, ...) below
+        # also expects raw logits, so no further change needed there.
+        log_p = torch.log_softmax(logits, dim=-1)  # [B, L, C]
 
         # Expand for gather: [B, K, L, C]
         log_p_expanded = log_p.unsqueeze(1).expand(-1, K, -1, -1)

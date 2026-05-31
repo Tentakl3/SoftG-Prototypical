@@ -82,9 +82,18 @@ class SoftProto_MNISTEvenOdd:
                 p_x = torch.softmax(-torch.cdist(z_x, self.protonet.prototypes), dim=1)
                 p_y = torch.softmax(-torch.cdist(z_y, self.protonet.prototypes), dim=1)
 
-                T = max(0.1, 1.0 * math.exp(-epoch / 10))
+                # NOTE(corr-1): removed per-batch override `T = max(0.1, exp(-epoch/10))`.
+                # T is now driven solely by the schedule branch at the end of the
+                # epoch so the `schedule` argument actually distinguishes runs.
 
-                z_anchor = self.protonet(self.anchor_imgs)
+                # NOTE(corr-11): forward anchor images in eval mode to avoid noisy
+                # batch-stats normalisation of the (size-10) anchor set. q_theta is
+                # consumed only by the MCMC kernel under no_grad, so no gradients
+                # need to flow back through z_anchor.
+                self.protonet.eval()
+                with torch.no_grad():
+                    z_anchor = self.protonet(self.anchor_imgs)
+                self.protonet.train()
 
                 anchorp_x = torch.softmax(-torch.cdist(z_x, z_anchor), dim=1)
                 anchorp_y = torch.softmax(-torch.cdist(z_y, z_anchor), dim=1)
@@ -335,14 +344,20 @@ class SoftProto_MNISTEvenOdd:
             tau = (P_new / P)**(1/T)
             v = torch.rand(tau.shape, device=device)
 
+            # NOTE(corr-22): mirrors corr-2 fix in the SoftG trainer. The previous
+            # `(v > tau) | (P_new < P)` reverted on every worse-likelihood proposal
+            # regardless of v — greedy hill-climbing, broken detailed balance.
+            # Correct Metropolis revert mask: worse AND random rejects, i.e.
+            # (v > tau) AND (P_new < P). corr-2 fixed SoftG; this companion fix
+            # applies the same to SoftPNet.
             if criteria == 'greedy':
                 mask = P_new < P
             elif criteria == 'mcmc':
-                mask = (v > tau) | (P_new < P)
+                mask = (v > tau) & (P_new < P)
 
             res = torch.where(mask, batch_candidates, new_candidates)
 
-        return res 
+        return res
     
     def prototype_loss(self, z_digits, batch_pairs):
         total_loss = 0.0
