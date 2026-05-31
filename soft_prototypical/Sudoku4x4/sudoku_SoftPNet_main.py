@@ -82,11 +82,14 @@ class SoftGPNet_Sudoku:
                 B, N, _ = digit_labels.shape
                 board_images_reshape = board_images.reshape(B*N*N, 1, 28, 28)
                 z_digits = self.protonet(board_images_reshape)
-                # NOTE(corr-11): anchor forward in eval mode so the small
+                # NOTE(corr-11 + corr-27): anchor forward in eval mode so the small
                 # anchor set (4 examples) doesn't drive noisy BN batch-stats.
+                # corr-27 needs gradients to flow back through z_anchor for the
+                # supervised anchor classification loss below, so the no_grad
+                # wrapper that corr-11 originally used is removed — eval mode
+                # alone is sufficient to silence the BN jitter.
                 self.protonet.eval()
-                with torch.no_grad():
-                    z_anchor = self.protonet(anchor_images)
+                z_anchor = self.protonet(anchor_images)
                 self.protonet.train()
 
                 z_digits_reshape = z_digits.reshape(B, N*N, -1)
@@ -146,7 +149,26 @@ class SoftGPNet_Sudoku:
                 # our paper's setting.
                 proto_anchor_loss = ((F.normalize(z_anchor, dim=-1) - p_norm) ** 2).mean()
 
-                total_loss = (1- self.alpha) * CE_loss  + self.alpha * (proto_loss + proto_anchor_loss)
+                # NOTE(corr-27): direct supervised classification loss on the
+                # anchor images. By construction anchor_images[i] is a labelled
+                # example of digit class i+1 (per databuilder convention), so
+                # the encoder must produce z_anchor[i] closest to prototype[i].
+                # corr-26 alone wasn't enough — CE_loss on MCMC's best-of-K
+                # candidate dominates the encoder's gradient and pulls z(x)
+                # toward permutation-consistent (but identity-wrong) targets.
+                # This term gives the encoder one direct label per class — the
+                # minimal supervision needed to break the reasoning shortcut,
+                # matching the "one labelled datapoint per concept" setting of
+                # Andolfi & Giunchiglia (2025).
+                anchor_score = -torch.cdist(F.normalize(z_anchor, dim=-1), p_norm)  # [num_classes, num_classes]
+                anchor_sup_loss = F.cross_entropy(
+                    anchor_score,
+                    torch.arange(self.num_classes, device=device),
+                )
+
+                total_loss = ((1- self.alpha) * CE_loss
+                              + self.alpha * (proto_loss + proto_anchor_loss)
+                              + anchor_sup_loss)
 
                 total_loss.backward()
                 optimizer.step()
