@@ -4,11 +4,11 @@ import math
 import torch.nn.functional as F
 from sklearn.metrics import f1_score
 
-from backbones.Sudoku4x4.CNN_Sudoku import MNISTConv
-from backbones.Sudoku4x4.PNet_Sudoku import LearnableProtoNet_CNN
-from samplers.Sudoku4x4.sudoku4x4_sampler import Sampler
-from projections.Sudoku4x4.projection_sudoku4x4 import Projection
-from ltn_utils.Sudoku4x4.ltn_utils_sudoku4x4 import Logic
+from backbones.Sudoku9x9.CNN_Sudoku import MNISTConv
+from backbones.Sudoku9x9.PNet_Sudoku import LearnableProtoNet_CNN
+from samplers.Sudoku9x9.sudoku9x9_sampler import Sampler
+from projections.Sudoku9x9.projection_sudoku9x9 import Projection
+from ltn_utils.Sudoku9x9.ltn_utils_sudoku9x9 import Logic
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -43,7 +43,7 @@ class SoftGPNet_Sudoku:
         test_board_f1s = []
         train_times = []
 
-        board_candidate_cache = torch.zeros((len(train_loader.dataset), K, 4, 4), dtype=torch.long).to(device) #[dataset_size, K, 4, 4]
+        board_candidate_cache = torch.zeros((len(train_loader.dataset), K, 9, 9), dtype=torch.long).to(device) #[dataset_size, K, 9, 9]
         start_time = torch.cuda.Event(enable_timing=True)
         end_time = torch.cuda.Event(enable_timing=True)
         # NOTE(corr-25): `start_time.record()` was missing, so the call to
@@ -108,13 +108,13 @@ class SoftGPNet_Sudoku:
                 idx_unsat = sample_idx[~logic_labels]
 
                 if epoch == 0:
-                    board_candidate_cache[idx_sat] = self.sampler.tensor_sat_sample_batch(len(idx_sat), K)  #[B, K, 4, 4]
-                    board_candidate_cache[idx_unsat] = self.sampler.tensor_unsat_sample_batch(len(idx_unsat), K)  #[B, K, 4, 4]
+                    board_candidate_cache[idx_sat] = self.sampler.tensor_sat_sample_batch(len(idx_sat), K)  #[B, K, 9, 9]
+                    board_candidate_cache[idx_unsat] = self.sampler.tensor_unsat_sample_batch(len(idx_unsat), K)  #[B, K, 9, 9]
                 elif epoch > sampling_epoch:
                     # For later epochs, we can use the model's current predictions to generate new candidates
                     board_candidate_cache[idx_sat] = self.switch_k_candidate(score[logic_labels], board_candidate_cache[idx_sat], T, projection, criteria, sat=True)
                     board_candidate_cache[idx_unsat] = self.switch_k_candidate(score[~logic_labels], board_candidate_cache[idx_unsat], T, projection, criteria, sat=False)
-                batch_candidates = board_candidate_cache[sample_idx]  #[B, K, 4, 4]
+                batch_candidates = board_candidate_cache[sample_idx]  #[B, K, 9, 9]
 
                 target_digits = (batch_candidates - 1).reshape(B, K, N*N)
                 CE_loss = self.k_entropy_loss(score, target_digits, T)
@@ -315,14 +315,14 @@ class SoftGPNet_Sudoku:
             B, K, _, _ = old_samples.shape
             if sat:
                 if projection == 'on':
-                    new_samples = self.projection.tensorized_mutate_sudoku_4x4(old_samples)  #[B, K, 4, 4]
+                    new_samples = self.projection.tensorized_mutate_sudoku_9x9(old_samples)  #[B, K, 9, 9]
                 elif projection == 'off':
-                    new_samples = self.sampler.tensor_sat_sample_batch(B*K, 1).reshape(B, K, 4, 4)  #[B, K, 4, 4]
+                    new_samples = self.sampler.tensor_sat_sample_batch(B*K, 1).reshape(B, K, 9, 9)  #[B, K, 9, 9]
             else:
                 if projection == 'on':
-                    new_samples = self.projection.tensorized_mutate_sudoku_4x4(old_samples)  #[B, K, 4, 4]
+                    new_samples = self.projection.tensorized_mutate_sudoku_9x9(old_samples)  #[B, K, 9, 9]
                 elif projection == 'off':
-                    new_samples = self.sampler.tensor_unsat_sample_batch(B*K, 1).reshape(B, K, 4, 4)  #[B, K, 4, 4]
+                    new_samples = self.sampler.tensor_unsat_sample_batch(B*K, 1).reshape(B, K, 9, 9)  #[B, K, 9, 9]
             
             old_loss = self.compute_energy_batch(logits, old_samples)
             new_loss = self.compute_energy_batch(logits, new_samples)
@@ -344,7 +344,7 @@ class SoftGPNet_Sudoku:
             else:
                 accept_mask = (new_loss < old_loss) | (v < tau)
             accept_mask_expanded = accept_mask.unsqueeze(-1).unsqueeze(-1)  # [B, K, 1, 1]
-            final_samples = torch.where(accept_mask_expanded, new_samples, old_samples) #type: ignore .long()  # [B, K, 4, 4]
+            final_samples = torch.where(accept_mask_expanded, new_samples, old_samples) #type: ignore .long()  # [B, K, 9, 9]
 
             return final_samples
 

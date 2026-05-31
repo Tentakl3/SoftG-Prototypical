@@ -82,14 +82,11 @@ class SoftProto_MNISTEvenOdd:
                 p_x = torch.softmax(-torch.cdist(z_x, self.protonet.prototypes), dim=1)
                 p_y = torch.softmax(-torch.cdist(z_y, self.protonet.prototypes), dim=1)
 
-                # NOTE(corr-1): removed per-batch override `T = max(0.1, exp(-epoch/10))`.
-                # T is now driven solely by the schedule branch at the end of the
-                # epoch so the `schedule` argument actually distinguishes runs.
+                # NOTE(corr-1): removed per-batch override of T; the schedule
+                # at end of epoch now solely controls the temperature.
 
-                # NOTE(corr-11): forward anchor images in eval mode to avoid noisy
-                # batch-stats normalisation of the (size-10) anchor set. q_theta is
-                # consumed only by the MCMC kernel under no_grad, so no gradients
-                # need to flow back through z_anchor.
+                # NOTE(corr-11): eval mode on the anchor forward suppresses
+                # BN jitter from the size-10 anchor batch.
                 self.protonet.eval()
                 with torch.no_grad():
                     z_anchor = self.protonet(self.anchor_imgs)
@@ -344,12 +341,8 @@ class SoftProto_MNISTEvenOdd:
             tau = (P_new / P)**(1/T)
             v = torch.rand(tau.shape, device=device)
 
-            # NOTE(corr-22): mirrors corr-2 fix in the SoftG trainer. The previous
-            # `(v > tau) | (P_new < P)` reverted on every worse-likelihood proposal
-            # regardless of v — greedy hill-climbing, broken detailed balance.
-            # Correct Metropolis revert mask: worse AND random rejects, i.e.
-            # (v > tau) AND (P_new < P). corr-2 fixed SoftG; this companion fix
-            # applies the same to SoftPNet.
+            # NOTE(corr-22): companion to corr-2; previous mask was OR rather
+            # than AND, yielding greedy hill-climbing instead of Metropolis.
             if criteria == 'greedy':
                 mask = P_new < P
             elif criteria == 'mcmc':

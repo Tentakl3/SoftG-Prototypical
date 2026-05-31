@@ -283,16 +283,8 @@ class SoftG_MNISTEvenOdd:
             tau = (P_new / P)**(1/T)
             v = torch.rand(tau.shape, device=device)
 
-            # NOTE(corr-2): `mask` is the REVERT mask (where True we keep old).
-            # Correct Metropolis on a likelihood P (not energy):
-            #   - if P_new >= P (new is better-or-equal): always accept new
-            #   - if P_new < P  (new is worse):
-            #         accept with prob tau = (P_new/P)^(1/T)
-            #         → revert when v >= tau
-            # So revert iff (worse AND random rejects).
-            # The previous `(v > tau) | (P_new < P)` was an OR, which reverted
-            # even when v < tau as long as P_new < P → greedy hill-climbing,
-            # broken detailed balance.
+            # NOTE(corr-2): Metropolis revert mask is (worse AND random
+            # rejects); the previous OR mask gave greedy hill-climbing.
             if criteria == 'greedy':
                 mask = P_new < P
             elif criteria == 'mcmc':

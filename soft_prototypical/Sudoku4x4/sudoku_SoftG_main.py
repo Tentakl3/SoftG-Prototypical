@@ -12,12 +12,15 @@ from ltn_utils.Sudoku4x4.ltn_utils_sudoku4x4 import Logic
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class Soft_Sudoku:
-    def __init__(self, num_classes, layer_sizes=(512, 256, 100, 10)):
+    def __init__(self, num_classes, layer_sizes=(512, 256, 100, 10), anchor_digits=None):
         self.cnn_s_d = MNISTConv(linear_layers_sizes=(256, 100, 84, num_classes)).to(ltn.device)
         self.num_classes = num_classes
         self.sampler = Sampler()
         self.logical = Logic()
         self.projection = Projection()
+        # NOTE(corr-28): one labelled image per class, used by the
+        # supervised anchor cross-entropy term in `train`.
+        self.anchor_digits = anchor_digits
         self.boards_cache = {}
         self.alpha = 0.05
 
@@ -91,7 +94,19 @@ class Soft_Sudoku:
                 # CrossEntropyLoss expects targets in [0, num_classes-1]. Sudoku digits are 1..4.
                 CE_loss, best_candidates = self.k_entropy_loss(p_digits.reshape(B, N*N, self.num_classes), target_digits)
 
-                total_loss = CE_loss
+                # NOTE(corr-28): supervised cross-entropy on the labelled
+                # anchors prevents the row/column/box permutation shortcut.
+                if self.anchor_digits is not None:
+                    anchor_imgs = self.anchor_digits.to(ltn.device)
+                    anchor_logits, _ = self.cnn_s_d(anchor_imgs)
+                    anchor_sup_loss = criterion(
+                        anchor_logits,
+                        torch.arange(self.num_classes, device=ltn.device),
+                    )
+                else:
+                    anchor_sup_loss = torch.zeros((), device=ltn.device)
+
+                total_loss = CE_loss + anchor_sup_loss
 
                 total_loss.backward()
                 optimizer.step()
@@ -269,9 +284,8 @@ class Soft_Sudoku:
             except:
                 tau = torch.ones_like(v)
 
-            # NOTE(corr-16): the unconditional `accept_mask = (new_loss<old_loss) | (v<tau)`
-            # that previously followed the if/elif overwrote the greedy branch, so the
-            # `criteria='greedy'` ablation actually ran MCMC. Removed the overwrite.
+            # NOTE(corr-16): trailing assignment of `accept_mask` after the
+            # if/elif disabled the greedy branch; removed.
             if criteria == 'greedy':
                 accept_mask = (new_loss < old_loss)
             elif criteria == 'mcmc':

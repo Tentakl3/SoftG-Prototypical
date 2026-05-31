@@ -1,7 +1,7 @@
 import torch
 import random
 import numpy as np
-from samplers.Sudoku4x4.sudoku4x4_sampler import Sampler
+from samplers.Sudoku9x9.sudoku9x9_sampler import Sampler
 from .mnist_sudoku_loader import get_mnist_digit_board, get_anchor_mnist_digit, load_mnist_by_digit, tensorized_load_mnist_by_digit, tensorized_get_mnist_digit_board, tensorized_get_anchor_mnist_digit
 from .sudoku_builder import generate_boards_set
 
@@ -11,7 +11,7 @@ def tensorized_split_boards(n_train, n_test):
     # NOTE(corr-6): the original split sampled SAT boards with replacement
     # for train and test separately, allowing leakage; we shuffle once and
     # slice disjoint windows.
-    sat_pool = sampler.sat_boards_cache.clone()         # [N_sat, 4, 4]
+    sat_pool = sampler.sat_boards_cache.clone()         # [N_sat, 9, 9]
     n_sat = sat_pool.shape[0]
     half_train = n_train // 2
     half_test = n_test // 2
@@ -90,7 +90,7 @@ def build_dataset(sat_set, unsat_set, mnist_source, idx):
 
     return torch.utils.data.TensorDataset(X, y, boards, idx)
 
-def get_mnist_sudoku4x4_dataset(n_train=100, n_test=25, batch_size=64):
+def get_mnist_sudoku9x9_dataset(n_train=100, n_test=25, batch_size=64):
 
     by_digit_train, by_digit_test = load_mnist_by_digit()
     sat_boards_set, unsat_boards_set = generate_boards_set()
@@ -118,7 +118,7 @@ def get_mnist_sudoku4x4_dataset(n_train=100, n_test=25, batch_size=64):
 
     return train_loader, test_loader, anchor_digits
 
-def tensorized_get_mnist_sudoku4x4_dataset(n_train=100, n_test=25, batch_size=64):
+def tensorized_get_mnist_sudoku9x9_dataset(n_train=100, n_test=25, batch_size=64):
 
     train_boards, train_labels, test_boards, test_labels = tensorized_split_boards(n_train, n_test)
     train_imgs, test_imgs, anchor_digits = tensorized_build_dataset(train_boards, test_boards)
@@ -139,5 +139,5 @@ def tensorized_get_mnist_sudoku4x4_dataset(n_train=100, n_test=25, batch_size=64
     return train_loader, test_loader, anchor_digits
 
 if __name__ == '__main__':
-    train_loader, test_loader, anchor_digits = tensorized_get_mnist_sudoku4x4_dataset(n_train=100, n_test=1000, batch_size=64)
+    train_loader, test_loader, anchor_digits = tensorized_get_mnist_sudoku9x9_dataset(n_train=100, n_test=1000, batch_size=64)
     print(train_loader.dataset[0])

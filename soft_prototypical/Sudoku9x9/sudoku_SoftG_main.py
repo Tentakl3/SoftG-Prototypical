@@ -4,30 +4,30 @@ import math
 import torch.nn.functional as F
 from sklearn.metrics import f1_score
 
-from backbones.Sudoku4x4.CNN_Sudoku import MNISTConv
-from backbones.Sudoku4x4.PNet_Sudoku import LearnableProtoNet_CNN
-from samplers.Sudoku4x4.sudoku4x4_sampler import Sampler
-from projections.Sudoku4x4.projection_sudoku4x4 import Projection
-from ltn_utils.Sudoku4x4.ltn_utils_sudoku4x4 import Logic
+from backbones.Sudoku9x9.CNN_Sudoku import MNISTConv
+from samplers.Sudoku9x9.sudoku9x9_sampler import Sampler
+from projections.Sudoku9x9.projection_sudoku9x9 import Projection
+from ltn_utils.Sudoku9x9.ltn_utils_sudoku9x9 import Logic
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class SoftGPNet_Sudoku:
+class Soft_Sudoku:
     def __init__(self, num_classes, layer_sizes=(512, 256, 100, 10), anchor_digits=None):
-        self.protonet = LearnableProtoNet_CNN(num_classes=num_classes).to(ltn.device)
+        self.cnn_s_d = MNISTConv(linear_layers_sizes=(256, 100, 84, num_classes)).to(ltn.device)
         self.num_classes = num_classes
         self.sampler = Sampler()
         self.logical = Logic()
         self.projection = Projection()
+        # NOTE(corr-28): one labelled image per class, used by the
+        # supervised anchor cross-entropy term in `train`.
         self.anchor_digits = anchor_digits
         self.boards_cache = {}
-        self.alpha = 0.8
+        self.alpha = 0.05
 
     def train(self, train_loader, test_loader, epochs, schedule, projection, criteria):
-        optimizer = torch.optim.Adam(self.protonet.parameters(), lr=0.001)
+        optimizer = torch.optim.Adam(self.cnn_s_d.parameters(), lr=0.001)
         criterion = torch.nn.CrossEntropyLoss()
-        anchor_images = self.anchor_digits.to(device) if self.anchor_digits is not None else None
-        sampling_epoch = 5
+        sampling_epoch = 3
 
         t = 1
         T = T0 = 1
@@ -43,13 +43,10 @@ class SoftGPNet_Sudoku:
         test_board_f1s = []
         train_times = []
 
-        board_candidate_cache = torch.zeros((len(train_loader.dataset), K, 4, 4), dtype=torch.long).to(device) #[dataset_size, K, 4, 4]
+        board_candidate_cache = torch.zeros((len(train_loader.dataset), K, 9, 9), dtype=torch.long).to(device) #[dataset_size, K, 9, 9]
         start_time = torch.cuda.Event(enable_timing=True)
         end_time = torch.cuda.Event(enable_timing=True)
-        # NOTE(corr-25): `start_time.record()` was missing, so the call to
-        # `start_time.elapsed_time(end_time)` raised at the first epoch end.
         start_time.record()
-
         for epoch in range(epochs):
             train_loss = 0.0
             total_train, correct_train = 0, 0
@@ -67,7 +64,7 @@ class SoftGPNet_Sudoku:
             test_correct_logic_match = 0
 
             p = min(10, 2 + 2*(epoch // 2))
-            self.protonet.train()
+            self.cnn_s_d.train()
             for batch_idx, (board_images, board_labels, digit_labels, sample_idx) in enumerate(train_loader):
                 optimizer.zero_grad()
                 board_images = board_images.to(ltn.device) #[64, 4, 4, 1, 28, 28]
@@ -75,88 +72,50 @@ class SoftGPNet_Sudoku:
                 digit_labels = digit_labels.to(ltn.device) #[64, 4, 4]
                 sample_idx = sample_idx.to(ltn.device) #[64]
 
-                p_norm = F.normalize(self.protonet.prototypes, dim=-1) #[num_classes, z_dim]
-
                 B, N, _ = digit_labels.shape
                 board_images_reshape = board_images.reshape(B*N*N, 1, 28, 28)
-                z_digits = self.protonet(board_images_reshape)
-                # NOTE(corr-11+corr-27): eval mode suppresses BN jitter on the
-                # small anchor batch; no_grad removed so the encoder receives
-                # gradients from the supervised anchor term below.
-                self.protonet.eval()
-                z_anchor = self.protonet(anchor_images)
-                self.protonet.train()
-
-                z_digits_reshape = z_digits.reshape(B, N*N, -1)
-                z_digits_reshape = F.normalize(z_digits_reshape, dim=-1)
-                z_anchor = F.normalize(z_anchor, dim=-1)
-
-                dist = torch.cdist(z_digits_reshape, p_norm) #[B, 16, 4]
-                # NOTE(corr-23): pass raw logits (`-dist`) to the MCMC energy
-                # and the cross-entropy; the previous code fed softmax
-                # probabilities, causing a double softmax. `p_digits` is kept
-                # only for the argmax readout.
-                score = -dist
-                p_digits = torch.softmax(score, dim=-1)
-
-                anchor_dist = torch.cdist(z_digits_reshape, z_anchor) #[B, 16, 4]
-                anchorp_digits = torch.softmax(-anchor_dist, dim=-1)
-                anchorp_digits_squared = anchorp_digits.reshape(B, N, N, -1)
+                p_digits, _ = self.cnn_s_d(board_images_reshape) #[B*N*N, num_classes]
+                p_digits_reshape = p_digits.reshape(B, N*N, self.num_classes) #[B, 16, num_classes]
 
                 logic_labels = (board_labels == 1) #[B]
                 idx_sat = sample_idx[logic_labels]
                 idx_unsat = sample_idx[~logic_labels]
 
                 if epoch == 0:
-                    board_candidate_cache[idx_sat] = self.sampler.tensor_sat_sample_batch(len(idx_sat), K)  #[B, K, 4, 4]
-                    board_candidate_cache[idx_unsat] = self.sampler.tensor_unsat_sample_batch(len(idx_unsat), K)  #[B, K, 4, 4]
+                    board_candidate_cache[idx_sat] = self.sampler.tensor_sat_sample_batch(len(idx_sat), K)  #[B, K, 9, 9]
+                    board_candidate_cache[idx_unsat] = self.sampler.tensor_unsat_sample_batch(len(idx_unsat), K)  #[B, K, 9, 9]
                 elif epoch > sampling_epoch:
                     # For later epochs, we can use the model's current predictions to generate new candidates
-                    board_candidate_cache[idx_sat] = self.switch_k_candidate(score[logic_labels], board_candidate_cache[idx_sat], T, projection, criteria, sat=True)
-                    board_candidate_cache[idx_unsat] = self.switch_k_candidate(score[~logic_labels], board_candidate_cache[idx_unsat], T, projection, criteria, sat=False)
-                batch_candidates = board_candidate_cache[sample_idx]  #[B, K, 4, 4]
+                    board_candidate_cache[idx_sat] = self.switch_k_candidate(p_digits_reshape[logic_labels], board_candidate_cache[idx_sat], T, projection, criteria, sat=True)
+                    board_candidate_cache[idx_unsat] = self.switch_k_candidate(p_digits_reshape[~logic_labels], board_candidate_cache[idx_unsat], T, projection, criteria, sat=False)
+                batch_candidates = board_candidate_cache[sample_idx]  #[B, K, 9, 9]
 
                 target_digits = (batch_candidates - 1).reshape(B, K, N*N)
-                CE_loss = self.k_entropy_loss(score, target_digits, T)
+                # CrossEntropyLoss expects targets in [0, num_classes-1]. Sudoku digits are 1..4.
+                CE_loss, best_candidates = self.k_entropy_loss(p_digits.reshape(B, N*N, self.num_classes), target_digits)
 
-                z_digits_flat = z_digits_reshape.reshape(B*N*N, -1) #[B*16]
-                best_target_digits = self.get_best_candidate(anchorp_digits, target_digits)  #[B, 4, 4]
-                best_target_digits_flat = best_target_digits.reshape(B*N*N)  #[B*16]
-                #proto_loss = self.prototype_loss_new(z_digits_flat, best_target_digits_flat + 1)
+                # NOTE(corr-28): supervised cross-entropy on the labelled
+                # anchors prevents the row/column/box permutation shortcut.
+                if self.anchor_digits is not None:
+                    anchor_imgs = self.anchor_digits.to(ltn.device)
+                    anchor_logits, _ = self.cnn_s_d(anchor_imgs)
+                    anchor_sup_loss = criterion(
+                        anchor_logits,
+                        torch.arange(self.num_classes, device=ltn.device),
+                    )
+                else:
+                    anchor_sup_loss = torch.zeros((), device=ltn.device)
 
-                proto_loss = self.prototype_loss_new(
-                    z_digits_flat,              # [B*16, embed_dim]
-                    best_target_digits_flat + 1 # [B*16], values in 1..4, ground truth
-                )
-
-                # NOTE(corr-26): aligns prototypes with the labelled anchor
-                # embeddings rather than only the (permutation-symmetric)
-                # MCMC best-of-K.
-                proto_anchor_loss = ((F.normalize(z_anchor, dim=-1) - p_norm) ** 2).mean()
-
-                # NOTE(corr-27): supervised cross-entropy on the labelled
-                # anchors; minimal grounding for digit identity.
-                anchor_score = -torch.cdist(F.normalize(z_anchor, dim=-1), p_norm)
-                anchor_sup_loss = F.cross_entropy(
-                    anchor_score,
-                    torch.arange(self.num_classes, device=device),
-                )
-
-                total_loss = ((1- self.alpha) * CE_loss
-                              + self.alpha * (proto_loss + proto_anchor_loss)
-                              + anchor_sup_loss)
+                total_loss = CE_loss + anchor_sup_loss
 
                 total_loss.backward()
                 optimizer.step()
                 train_loss += total_loss.item()
 
-
                 pred_digits = torch.argmax(p_digits, dim=-1).reshape(B*N*N)
                 true_digits = (digit_labels-1).reshape(B*N*N)
 
                 correct_digits = (pred_digits == true_digits).detach()
-                correct_latent = (best_target_digits_flat == true_digits).detach()
-                correct_train_latent += correct_latent.sum().item()
 
                 correct_train += correct_digits.sum().item()
                 total_train += correct_digits.numel()
@@ -174,6 +133,8 @@ class SoftGPNet_Sudoku:
                 train_correct_logic_match += (logical_preds == board_labels).sum().item()
                 train_total_boards += B
 
+                correct_train_latent += ((best_candidates-1).reshape(B*N*N) == true_digits).sum().item()
+
             end_time.record()
             torch.cuda.synchronize()
             train_times.append(start_time.elapsed_time(end_time)/1000)
@@ -183,14 +144,13 @@ class SoftGPNet_Sudoku:
             train_digit_f1 = f1_score(all_true_digits, all_pred_digits, average='macro')
             train_board_f1 = f1_score(all_pred_boards, all_true_boards, average='macro')
             train_board_acc = train_correct_logic_match / train_total_boards
-            train_digit_acc = correct_train / total_train
 
             all_pred_digits = []
             all_true_digits = []
             all_pred_boards = []
             all_true_boards = []
 
-            self.protonet.eval()
+            self.cnn_s_d.eval()
             for batch_idx, (board_images, board_labels, digit_labels, sample_idx) in enumerate(test_loader):
                 
                 with torch.no_grad():
@@ -198,20 +158,11 @@ class SoftGPNet_Sudoku:
                     board_labels = board_labels.to(ltn.device)
                     digit_labels = digit_labels.to(ltn.device)
 
-                    p_norm = F.normalize(self.protonet.prototypes, dim=-1)
+                    B, N, _ = board_images.shape[:3]
 
-                    B, N, _ = digit_labels.shape
                     board_images_reshape = board_images.reshape(B*N*N, 1, 28, 28)
-                    z_digits = self.protonet(board_images_reshape)
-                    #z_anchor = self.protonet(anchor_images)
 
-                    z_digits_reshape = z_digits.reshape(B, N*N, -1)
-                    z_digits_reshape = F.normalize(z_digits_reshape, dim=-1)
-                    #z_anchor = F.normalize(z_anchor, dim=-1)
-
-                    dist = torch.cdist(z_digits_reshape, p_norm) #[B, 16, 4]
-                    p_digits = torch.softmax(-dist, dim=-1)
-
+                    p_digits, _ = self.cnn_s_d(board_images_reshape)
                     pred_digits = torch.argmax(p_digits, dim=-1).reshape(B*N*N)
                     true_digits = (digit_labels-1).reshape(B*N*N)
 
@@ -270,8 +221,6 @@ class SoftGPNet_Sudoku:
                 print(" epoch %d | loss %.4f | Train Board Acc %.4f | Train Board F1 %.4f | Train Digit Acc %.4f | Train Digit F1 %.4f | Test Board Acc %.4f | Test Board F1 %.4f | Test Digit Acc %.4f | Test Digit F1 %.4f | Latent Digit Acc %.4f"
                     %(epoch, train_loss, train_board_acc, train_board_f1, train_digit_acc, train_digit_f1, test_board_acc, test_board_f1, test_digit_acc, test_digit_f1, train_latent_acc))
         return{
-            'embedding':self.protonet.embedding,
-            'prototypes':F.normalize(self.protonet.prototypes, dim=-1).cpu().detach().numpy(),
             'train_digit_accs':train_digit_accs,
             'test_digit_accs':test_digit_accs,
             'train_board_accs':train_board_accs,
@@ -315,14 +264,14 @@ class SoftGPNet_Sudoku:
             B, K, _, _ = old_samples.shape
             if sat:
                 if projection == 'on':
-                    new_samples = self.projection.tensorized_mutate_sudoku_4x4(old_samples)  #[B, K, 4, 4]
+                    new_samples = self.projection.tensorized_mutate_sudoku_9x9(old_samples)  #[B, K, 9, 9]
                 elif projection == 'off':
-                    new_samples = self.sampler.tensor_sat_sample_batch(B*K, 1).reshape(B, K, 4, 4)  #[B, K, 4, 4]
+                    new_samples = self.sampler.tensor_sat_sample_batch(B*K, 1).reshape(B, K, 9, 9)  #[B, K, 9, 9]
             else:
                 if projection == 'on':
-                    new_samples = self.projection.tensorized_mutate_sudoku_4x4(old_samples)  #[B, K, 4, 4]
+                    new_samples = self.projection.tensorized_mutate_sudoku_9x9(old_samples)  #[B, K, 9, 9]
                 elif projection == 'off':
-                    new_samples = self.sampler.tensor_unsat_sample_batch(B*K, 1).reshape(B, K, 4, 4)  #[B, K, 4, 4]
+                    new_samples = self.sampler.tensor_unsat_sample_batch(B*K, 1).reshape(B, K, 9, 9)  #[B, K, 9, 9]
             
             old_loss = self.compute_energy_batch(logits, old_samples)
             new_loss = self.compute_energy_batch(logits, new_samples)
@@ -344,22 +293,20 @@ class SoftGPNet_Sudoku:
             else:
                 accept_mask = (new_loss < old_loss) | (v < tau)
             accept_mask_expanded = accept_mask.unsqueeze(-1).unsqueeze(-1)  # [B, K, 1, 1]
-            final_samples = torch.where(accept_mask_expanded, new_samples, old_samples) #type: ignore .long()  # [B, K, 4, 4]
+            final_samples = torch.where(accept_mask_expanded, new_samples, old_samples) #type: ignore .long()  # [B, K, 9, 9]
 
             return final_samples
 
-    def k_entropy_loss(self, logits, samples, T):
+    def k_entropy_loss(self, logits, samples):
         """
-        Pick the single lowest-energy grounding and apply standard cross-entropy.
-
-        logits:  [B, N*N, num_classes]  (raw scores = -dist, NOT probabilities,
-                                          see NOTE(corr-23) in train loop)
+        Instead of free-energy over all K candidates,
+        pick the single lowest-energy grounding and apply standard cross-entropy.
+        
+        logits:  [B, N*N, num_classes]  (raw log-probs or logits from log_softmax)
         samples: [B, K, N*N]            (candidate digit labels, 0-indexed)
         """
         B, K, L = samples.shape
 
-        # NOTE(corr-23): `logits` are raw scores; use log_softmax rather
-        # than log(probs). F.cross_entropy below already expects raw logits.
         log_p = torch.log_softmax(logits, dim=-1)  # [B, L, C]
 
         # Expand for gather: [B, K, L, C]
@@ -386,65 +333,8 @@ class SoftGPNet_Sudoku:
         # logits is [B, L, C] → need [B, C, L] for F.cross_entropy
         loss = F.cross_entropy(
             logits.permute(0, 2, 1),   # [B, C, L]
-            best_candidates,           # [B, L]  (class indices, 0-indexed)
+            best_candidates,           # [B, L]  (class indices)
             reduction='mean'
         )
 
-        return loss
-
-
-    def get_best_candidate(self, anchor_logits, candidates):
-        with torch.no_grad():
-            B, K, _ = candidates.shape
-            anchor_log_p = torch.log(anchor_logits)  # [B, 16, C]
-
-            # Expand for gather
-            anchor_log_p_expanded = anchor_log_p.unsqueeze(1).expand(-1, K, -1, -1)  # [B, K, 16, C]
-
-            # Gather log probs of candidates
-            gathered_logp = torch.gather(
-                anchor_log_p_expanded,
-                -1,
-                candidates.unsqueeze(-1)
-            ).squeeze(-1)  # [B, K, 16]
-
-            # Energy per candidate (mean over positions)
-            energy = -gathered_logp.mean(dim=-1)  # [B, K]
-
-            best_indices = torch.argmin(energy, dim=1)  # [B]
-            best_candidates = candidates[torch.arange(B), best_indices]  # [B, 4, 4]
-
-            return best_candidates
-    
-    def prototype_loss_new(self, z_digits, batch_boards):
-
-        total_loss = 0.0
-
-        centroids = {}
-        z_queries = {}
-        p_norm = F.normalize(self.protonet.prototypes, dim=-1)
-        z_digits = F.normalize(z_digits, dim=-1)
-        for i in range(self.num_classes):
-            z_i = z_digits[batch_boards == i+1]
-            n_i = z_i.shape[0]
-            if n_i > 2:
-                idx = torch.randperm(n_i)
-                q_idx = idx[: n_i // 2]
-                s_idx = idx[n_i // 2 :]
-
-                z_support = z_i[s_idx]
-                z_query   = z_i[q_idx]
-
-                c_i = z_support.mean(dim=0)
-                c_i = F.normalize(c_i, dim=-1)
-
-                class_loss = torch.mean((z_query - c_i) ** 2)
-
-                proto_loss = torch.mean((c_i - p_norm[i]) ** 2)
-
-                total_loss += class_loss + proto_loss
-
-                z_queries[i] = z_query
-                centroids[i] = c_i
-
-        return total_loss / len(centroids)
+        return loss, best_candidates
